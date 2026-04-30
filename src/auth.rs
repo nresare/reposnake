@@ -153,7 +153,7 @@ fn discovery_decoding_key(
 fn discovery_client(authentication: &AuthenticationConfig) -> anyhow::Result<Client> {
     let mut builder = Client::builder();
 
-    if authentication.issuer == kubernetes::KUBERNETES_SERVICE_HOST {
+    if kubernetes::is_kubernetes_service_issuer(&authentication.issuer) {
         debug!("configuring Kubernetes-specific HTTP client settings for validation key discovery");
         builder = kubernetes::configure_in_cluster_client(builder)?;
     }

@@ -48,14 +48,6 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(simple_root))
         .route("/healthz", get(healthz))
-        .route("/simple", get(legacy_simple_root_redirect))
-        .route("/simple/", get(legacy_simple_root_redirect))
-        .route("/simple/{project}", get(legacy_simple_project_redirect))
-        .route("/simple/{project}/", get(legacy_simple_project_redirect))
-        .route(
-            "/simple/{project}/{filename}",
-            get(legacy_simple_package_redirect),
-        )
         .route("/packages/{project}/{filename}", get(download_package))
         .route("/{project}", get(simple_project_redirect))
         .route("/{project}/", get(simple_project))
@@ -75,26 +67,8 @@ async fn healthz() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-async fn legacy_simple_root_redirect() -> Redirect {
-    Redirect::permanent("/")
-}
-
 async fn simple_project_redirect(Path(project): Path<String>) -> Redirect {
     Redirect::permanent(&format!("/{}/", normalize_name(&project)))
-}
-
-async fn legacy_simple_project_redirect(Path(project): Path<String>) -> Redirect {
-    simple_project_redirect(Path(project)).await
-}
-
-async fn legacy_simple_package_redirect(
-    Path((project, filename)): Path<(String, String)>,
-) -> Redirect {
-    Redirect::permanent(&format!(
-        "/{}/{}",
-        normalize_name(&project),
-        url_path_segment(&filename)
-    ))
 }
 
 async fn simple_root(
@@ -328,7 +302,8 @@ impl SubjectValidator {
         };
         let bearer_token = bearer_token
             .ok_or_else(|| AppError::Unauthorized("missing Authorization header".to_string()))?;
-        let algorithm = auth::algorithm(authentication).map_err(AppError::from)?;
+        let (algorithm, decoding_key) =
+            auth::decoding_key_for_token(authentication, bearer_token).map_err(AppError::from)?;
         debug!(
             algorithm = ?algorithm,
             audience = %authentication.audience,
@@ -338,7 +313,6 @@ impl SubjectValidator {
         let mut validation = Validation::new(algorithm);
         validation.set_audience(&[&authentication.audience]);
         validation.set_issuer(&[&authentication.issuer]);
-        let decoding_key = auth::decoding_key(authentication).map_err(AppError::from)?;
 
         let decoded =
             decode::<SourceClaims>(bearer_token, &decoding_key, &validation).map_err(|error| {
@@ -827,6 +801,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn simple_prefix_is_not_a_compatibility_index() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = unauthenticated_state(tempdir.path());
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/simple/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn upload_accepts_jwt_as_basic_password() {
         let tempdir = tempfile::tempdir().unwrap();
         let state = authenticated_state(tempdir.path());
@@ -904,7 +897,6 @@ mod tests {
                     audience: "reposnake".to_string(),
                     issuer: "https://issuer.example".to_string(),
                     validation_key: Some("shared-secret".to_string()),
-                    algorithm: "HS256".to_string(),
                 },
                 false,
             ),

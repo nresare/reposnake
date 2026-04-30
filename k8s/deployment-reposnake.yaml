@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reposnake
+  labels:
+    app: reposnake
+spec:
+  # package storage is a single writable filesystem, so run one instance
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: reposnake
+  template:
+    metadata:
+      labels:
+        app: reposnake
+    spec:
+      volumes:
+        - name: config
+          configMap:
+            name: reposnake
+        - name: data
+          persistentVolumeClaim:
+            claimName: reposnake
+      initContainers:
+        - name: fix-data-permissions
+          securityContext:
+            allowPrivilegeEscalation: false
+          image: {{alpine_image}}
+          command:
+            - sh
+            - -c
+            - "mkdir -p /data && chown -R 65532:65532 /data"
+          volumeMounts:
+            - mountPath: /data
+              name: data
+      containers:
+        - name: reposnake
+          securityContext:
+            allowPrivilegeEscalation: false
+          image: {{reposnake_image}}
+          volumeMounts:
+            - mountPath: /config
+              name: config
+              subPath: config
+            - mountPath: /data
+              name: data
+          ports:
+            - name: web
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: web
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: web

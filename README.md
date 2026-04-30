@@ -8,13 +8,15 @@ It serves the Simple Repository API from the service root, stores uploaded artif
 
 ```toml
 bind_address = "0.0.0.0:8080"
-storage_directory = "/var/lib/reposnake"
+storage_directory = "/data"
 max_upload_bytes = 104857600
 
 [authentication]
 audience = "reposnake"
 issuer = "https://issuer.example"
-algorithm = "RS256"
+
+# Optional. If omitted, reposnake fetches
+# <issuer>/.well-known/openid-configuration and uses the returned jwks_uri.
 validation_key = """
 -----BEGIN PUBLIC KEY-----
 ...
@@ -42,7 +44,7 @@ pip install --extra-index-url http://localhost:8080 example-package
 
 The root project list is available at `/` and project pages at `/{normalized-project}/`.
 Project pages publish package file links as relative basenames, for example `example_package-0.1.0-py3-none-any.whl#sha256=...`.
-Those links resolve under the project page URL, while `/simple/...` and `/packages/{normalized-project}/{filename}` remain available as compatibility aliases.
+Those links resolve under the project page URL.
 
 ## Uploading
 

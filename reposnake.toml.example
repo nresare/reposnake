@@ -1,11 +1,13 @@
 bind_address = "0.0.0.0:8080"
-storage_directory = "/var/lib/reposnake"
+storage_directory = "/data"
 max_upload_bytes = 104857600
 
 [authentication]
 audience = "reposnake"
 issuer = "https://issuer.example"
-algorithm = "RS256"
+
+# Optional. If omitted, reposnake fetches
+# <issuer>/.well-known/openid-configuration and uses the returned jwks_uri.
 validation_key = """
 -----BEGIN PUBLIC KEY-----
 ...

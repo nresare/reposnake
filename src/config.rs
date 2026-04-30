@@ -28,8 +28,6 @@ pub struct AuthenticationConfig {
     #[serde(default)]
     pub issuer: String,
     pub validation_key: Option<String>,
-    #[serde(default = "default_authentication_algorithm")]
-    pub algorithm: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -104,9 +102,9 @@ impl AuthenticationConfig {
         }
         match self.validation_key.as_deref() {
             Some(validation_key) if !validation_key.is_empty() => {}
+            None => {}
             _ => anyhow::bail!("authentication.validation_key must not be empty"),
         }
-        crate::auth::algorithm(self)?;
         Ok(())
     }
 }
@@ -126,15 +124,11 @@ fn default_bind_address() -> String {
 }
 
 fn default_storage_directory() -> PathBuf {
-    "/var/lib/reposnake".into()
+    "/data".into()
 }
 
 fn default_max_upload_bytes() -> usize {
     100 * 1024 * 1024
-}
-
-fn default_authentication_algorithm() -> String {
-    "RS256".to_string()
 }
 
 #[cfg(test)]
@@ -150,7 +144,6 @@ storage_directory = "/tmp/reposnake"
 [authentication]
 audience = "reposnake"
 issuer = "https://issuer.example"
-algorithm = "HS256"
 validation_key = "shared-secret"
 
 [[publisher]]
@@ -188,7 +181,6 @@ projects = ["*"]
 [authentication]
 audience = "reposnake"
 issuer = "https://issuer.example"
-algorithm = "HS256"
 validation_key = "shared-secret"
 "#,
         )
@@ -199,5 +191,25 @@ validation_key = "shared-secret"
             error.to_string(),
             "at least one [[publisher]] entry is required"
         );
+    }
+
+    #[test]
+    fn validation_key_is_optional_when_auth_is_enabled() {
+        let config: Config = toml::from_str(
+            r#"
+[authentication]
+audience = "reposnake"
+issuer = "https://issuer.example"
+
+[[publisher]]
+projects = ["*"]
+
+[publisher.required_claims]
+sub = "buildkite:deploy"
+"#,
+        )
+        .unwrap();
+
+        config.validate(false).unwrap();
     }
 }

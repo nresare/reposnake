@@ -19,7 +19,7 @@ struct Cli {
         name = "config-file",
         short = 'c',
         long = "config-file",
-        default_value = "/config/reposnake.toml"
+        default_value = "/config"
     )]
     config_path: String,
     #[arg(long = "disable-auth", default_value_t = false)]

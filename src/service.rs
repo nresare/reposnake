@@ -46,13 +46,20 @@ pub fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Result<Ap
 pub fn build_router(state: AppState) -> Router {
     let max_upload_bytes = state.max_upload_bytes;
     Router::new()
-        .route("/", get(index_redirect))
+        .route("/", get(simple_root))
         .route("/healthz", get(healthz))
-        .route("/simple", get(simple_root_redirect))
-        .route("/simple/", get(simple_root))
-        .route("/simple/{project}", get(simple_project_redirect))
-        .route("/simple/{project}/", get(simple_project))
+        .route("/simple", get(legacy_simple_root_redirect))
+        .route("/simple/", get(legacy_simple_root_redirect))
+        .route("/simple/{project}", get(legacy_simple_project_redirect))
+        .route("/simple/{project}/", get(legacy_simple_project_redirect))
+        .route(
+            "/simple/{project}/{filename}",
+            get(legacy_simple_package_redirect),
+        )
         .route("/packages/{project}/{filename}", get(download_package))
+        .route("/{project}", get(simple_project_redirect))
+        .route("/{project}/", get(simple_project))
+        .route("/{project}/{filename}", get(download_project_package))
         .route("/legacy", post(upload_distribution))
         .route("/legacy/", post(upload_distribution))
         .layer(DefaultBodyLimit::max(max_upload_bytes))
@@ -64,20 +71,30 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn index_redirect() -> Redirect {
-    Redirect::temporary("/simple/")
-}
-
 async fn healthz() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-async fn simple_root_redirect() -> Redirect {
-    Redirect::permanent("/simple/")
+async fn legacy_simple_root_redirect() -> Redirect {
+    Redirect::permanent("/")
 }
 
 async fn simple_project_redirect(Path(project): Path<String>) -> Redirect {
-    Redirect::permanent(&format!("/simple/{}/", normalize_name(&project)))
+    Redirect::permanent(&format!("/{}/", normalize_name(&project)))
+}
+
+async fn legacy_simple_project_redirect(Path(project): Path<String>) -> Redirect {
+    simple_project_redirect(Path(project)).await
+}
+
+async fn legacy_simple_package_redirect(
+    Path((project, filename)): Path<(String, String)>,
+) -> Redirect {
+    Redirect::permanent(&format!(
+        "/{}/{}",
+        normalize_name(&project),
+        url_path_segment(&filename)
+    ))
 }
 
 async fn simple_root(
@@ -99,7 +116,7 @@ async fn simple_project(
 ) -> Result<Response, AppError> {
     let normalized_project = normalize_name(&project);
     if normalized_project != project {
-        return Ok(Redirect::permanent(&format!("/simple/{normalized_project}/")).into_response());
+        return Ok(Redirect::permanent(&format!("/{normalized_project}/")).into_response());
     }
 
     let project = state.repository.project(&normalized_project).await?;
@@ -113,6 +130,30 @@ async fn simple_project(
 async fn download_package(
     Path((project, filename)): Path<(String, String)>,
     State(state): State<AppState>,
+) -> Result<Response, AppError> {
+    package_response(&project, &filename, &state).await
+}
+
+async fn download_project_package(
+    Path((project, filename)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Response, AppError> {
+    let normalized_project = normalize_name(&project);
+    if normalized_project != project {
+        return Ok(Redirect::permanent(&format!(
+            "/{normalized_project}/{}",
+            url_path_segment(&filename)
+        ))
+        .into_response());
+    }
+
+    package_response(&normalized_project, &filename, &state).await
+}
+
+async fn package_response(
+    project: &str,
+    filename: &str,
+    state: &AppState,
 ) -> Result<Response, AppError> {
     let (content, _record) = state.repository.read_file(&project, &filename).await?;
     Response::builder()
@@ -514,7 +555,7 @@ fn simple_json_response<T: Serialize>(body: &T) -> Result<Response, AppError> {
 fn render_project_list(projects: &[ProjectSummary]) -> String {
     let mut html = simple_html_start("reposnake projects");
     for project in projects {
-        html.push_str("<a href=\"/simple/");
+        html.push_str("<a href=\"/");
         html.push_str(&escape_html_attr(&project.normalized_name));
         html.push_str("/\">");
         html.push_str(&escape_html_text(&project.name));
@@ -527,10 +568,8 @@ fn render_project_list(projects: &[ProjectSummary]) -> String {
 fn render_project_detail(project: &ProjectIndex) -> String {
     let mut html = simple_html_start(&project.normalized_name);
     for file in &project.files {
-        html.push_str("<a href=\"/packages/");
-        html.push_str(&escape_html_attr(&project.normalized_name));
-        html.push('/');
-        html.push_str(&escape_html_attr(&file.filename));
+        html.push_str("<a href=\"");
+        html.push_str(&escape_html_attr(&url_path_segment(&file.filename)));
         html.push_str("#sha256=");
         html.push_str(&escape_html_attr(&file.sha256));
         html.push('"');
@@ -564,6 +603,18 @@ fn escape_html_text(value: &str) -> String {
 
 fn escape_html_attr(value: &str) -> String {
     escape_html_text(value).replace('"', "&quot;")
+}
+
+fn url_path_segment(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 #[derive(Serialize)]
@@ -644,9 +695,9 @@ struct ProjectFileJson {
 }
 
 impl ProjectFileJson {
-    fn from_record(normalized_project: &str, file: FileRecord) -> Self {
+    fn from_record(_normalized_project: &str, file: FileRecord) -> Self {
         Self {
-            url: format!("/packages/{normalized_project}/{}", file.filename),
+            url: url_path_segment(&file.filename),
             filename: file.filename,
             hashes: BTreeMap::from([("sha256".to_string(), file.sha256)]),
             size: file.size,
@@ -699,7 +750,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/simple/reposnake-demo/")
+                    .uri("/reposnake-demo/")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -715,12 +766,12 @@ mod tests {
         assert!(body.contains(&format!(
             "pypi:repository-version\" content=\"{SIMPLE_API_VERSION}"
         )));
-        assert!(body.contains("reposnake_demo-0.1.0.tar.gz#sha256="));
+        assert!(body.contains("href=\"reposnake_demo-0.1.0.tar.gz#sha256="));
 
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/packages/reposnake-demo/reposnake_demo-0.1.0.tar.gz")
+                    .uri("/reposnake-demo/reposnake_demo-0.1.0.tar.gz")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -729,6 +780,50 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"package-content");
+    }
+
+    #[tokio::test]
+    async fn simple_json_uses_relative_artifact_basenames() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = unauthenticated_state(tempdir.path());
+        let app = build_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/legacy/")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "multipart/form-data; boundary=reposnake-boundary",
+                    )
+                    .body(Body::from(multipart_upload_body(
+                        "reposnake_demo",
+                        "0.1.0",
+                        b"package-content",
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/reposnake-demo/")
+                    .header(header::ACCEPT, "application/vnd.pypi.simple.v1+json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(body["files"][0]["url"], "reposnake_demo-0.1.0.tar.gz");
     }
 
     #[tokio::test]

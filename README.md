@@ -2,7 +2,7 @@
 
 `reposnake` is a small Axum service that stores Python distribution files and exposes a minimal PyPI-compatible package index.
 
-It serves the Simple Repository API under `/simple/`, stores uploaded artifacts on the filesystem, and accepts uploads through a Twine-compatible `/legacy/` endpoint. Uploads are authorized with JWTs.
+It serves the Simple Repository API from the service root, stores uploaded artifacts on the filesystem, and accepts uploads through a Twine-compatible `/legacy/` endpoint. Uploads are authorized with JWTs.
 
 ## Configuration
 
@@ -37,10 +37,12 @@ Project names in `projects` are normalized using the Python packaging rules, so 
 Point pip at the Simple API:
 
 ```sh
-pip install --index-url http://localhost:8080/simple/ example-package
+pip install --extra-index-url http://localhost:8080 example-package
 ```
 
-The root project list is available at `/simple/`, project pages at `/simple/{normalized-project}/`, and package files at `/packages/{normalized-project}/{filename}`.
+The root project list is available at `/` and project pages at `/{normalized-project}/`.
+Project pages publish package file links as relative basenames, for example `example_package-0.1.0-py3-none-any.whl#sha256=...`.
+Those links resolve under the project page URL, while `/simple/...` and `/packages/{normalized-project}/{filename}` remain available as compatibility aliases.
 
 ## Uploading
 

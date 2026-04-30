@@ -1,0 +1,21 @@
+bind_address = "0.0.0.0:8080"
+storage_directory = "/var/lib/reposnake"
+max_upload_bytes = 104857600
+
+[authentication]
+audience = "reposnake"
+issuer = "https://issuer.example"
+algorithm = "RS256"
+validation_key = """
+-----BEGIN PUBLIC KEY-----
+...
+-----END PUBLIC KEY-----
+"""
+
+[[publisher]]
+name = "ci"
+projects = ["example-package"]
+
+[publisher.required_claims]
+sub = "system:serviceaccount:build:publisher"
+repository = "example-package"

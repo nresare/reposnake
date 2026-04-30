@@ -4,13 +4,14 @@
 use crate::auth;
 use crate::config::{AuthenticationConfig, Config, PublisherConfig};
 use crate::error::AppError;
+use crate::oci::{DOCKER_DISTRIBUTION_API_VERSION, OciRegistry};
 use crate::package::{
     FileRecord, ProjectIndex, ProjectSummary, SIMPLE_API_VERSION, UploadPackage, normalize_name,
 };
 use crate::repository::PackageRepository;
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -29,6 +30,7 @@ const SIMPLE_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
 #[derive(Clone)]
 pub struct AppState {
     pub repository: PackageRepository,
+    pub oci_registry: OciRegistry,
     pub subject_validator: SubjectValidator,
     pub publishers: Arc<Vec<PublisherConfig>>,
     pub max_upload_bytes: usize,
@@ -37,6 +39,7 @@ pub struct AppState {
 pub fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Result<AppState> {
     Ok(AppState {
         repository: PackageRepository::new(config.storage_directory.clone()),
+        oci_registry: OciRegistry::new(config.storage_directory.clone()),
         subject_validator: SubjectValidator::new(config.authentication.clone(), disable_auth),
         publishers: Arc::new(config.publishers.clone()),
         max_upload_bytes: config.max_upload_bytes,
@@ -48,6 +51,22 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(simple_root))
         .route("/healthz", get(healthz))
+        .route(
+            "/v2",
+            get(oci_api_version_check).head(oci_api_version_check),
+        )
+        .route(
+            "/v2/",
+            get(oci_api_version_check).head(oci_api_version_check),
+        )
+        .route(
+            "/v2/{*path}",
+            get(oci_dispatch)
+                .head(oci_dispatch)
+                .post(oci_dispatch)
+                .put(oci_dispatch)
+                .patch(oci_dispatch),
+        )
         .route("/packages/{project}/{filename}", get(download_package))
         .route("/{project}", get(simple_project_redirect))
         .route("/{project}/", get(simple_project))
@@ -65,6 +84,123 @@ pub fn build_router(state: AppState) -> Router {
 
 async fn healthz() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+async fn oci_api_version_check(method: Method) -> Result<Response, AppError> {
+    if method != Method::GET && method != Method::HEAD {
+        return method_not_allowed();
+    }
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from("{}")
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            "Docker-Distribution-API-Version",
+            DOCKER_DISTRIBUTION_API_VERSION,
+        )
+        .body(body)
+        .map_err(|error| AppError::Internal(format!("failed to build OCI response: {error}")))
+}
+
+async fn oci_dispatch(
+    Path(path): Path<String>,
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    if let Some((repository, upload_uuid)) = split_oci_upload_path(&path) {
+        return match method {
+            Method::PATCH => {
+                let claims = authenticate_push(&state, &headers)?;
+                state.authorize_oci_repository(repository, &claims)?;
+                let upload = state
+                    .oci_registry
+                    .append_upload(repository, upload_uuid, body)
+                    .await?;
+                oci_upload_response(repository, &upload.uuid, upload.size)
+            }
+            Method::PUT => {
+                let digest = query.get("digest").ok_or_else(|| {
+                    AppError::BadRequest("missing digest query parameter".to_string())
+                })?;
+                let claims = authenticate_push(&state, &headers)?;
+                state.authorize_oci_repository(repository, &claims)?;
+                let blob = state
+                    .oci_registry
+                    .finish_upload(repository, upload_uuid, digest, body)
+                    .await?;
+                oci_created_response(
+                    &format!("/v2/{repository}/blobs/{}", blob.digest),
+                    &blob.digest,
+                )
+            }
+            _ => method_not_allowed(),
+        };
+    }
+
+    if let Some(repository) = split_oci_upload_start_path(&path) {
+        return match method {
+            Method::POST => {
+                let claims = authenticate_push(&state, &headers)?;
+                state.authorize_oci_repository(repository, &claims)?;
+                if let Some(digest) = query.get("digest") {
+                    let blob = state
+                        .oci_registry
+                        .store_blob(repository, digest, body)
+                        .await?;
+                    oci_created_response(
+                        &format!("/v2/{repository}/blobs/{}", blob.digest),
+                        &blob.digest,
+                    )
+                } else {
+                    let upload = state.oci_registry.start_upload(repository).await?;
+                    oci_upload_response(repository, &upload.uuid, upload.size)
+                }
+            }
+            _ => method_not_allowed(),
+        };
+    }
+
+    if let Some((repository, digest)) = split_oci_blob_path(&path) {
+        return match method {
+            Method::GET => oci_get_blob(&state, repository, digest, false).await,
+            Method::HEAD => oci_get_blob(&state, repository, digest, true).await,
+            _ => method_not_allowed(),
+        };
+    }
+
+    if let Some((repository, reference)) = split_oci_manifest_path(&path) {
+        return match method {
+            Method::GET => oci_get_manifest(&state, repository, reference, false).await,
+            Method::HEAD => oci_get_manifest(&state, repository, reference, true).await,
+            Method::PUT => {
+                let claims = authenticate_push(&state, &headers)?;
+                state.authorize_oci_repository(repository, &claims)?;
+                let content_type = headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("application/vnd.oci.image.manifest.v1+json");
+                let manifest = state
+                    .oci_registry
+                    .store_manifest(repository, reference, content_type, body)
+                    .await?;
+                oci_created_response(
+                    &format!("/v2/{repository}/manifests/{}", manifest.digest),
+                    &manifest.digest,
+                )
+            }
+            _ => method_not_allowed(),
+        };
+    }
+
+    Err(AppError::NotFound(format!(
+        "unknown OCI registry path '/v2/{path}'"
+    )))
 }
 
 async fn simple_project_redirect(Path(project): Path<String>) -> Redirect {
@@ -136,6 +272,125 @@ async fn package_response(
         .header(header::CONTENT_LENGTH, content.len().to_string())
         .body(Body::from(content))
         .map_err(|error| AppError::Internal(format!("failed to build file response: {error}")))
+}
+
+async fn oci_get_blob(
+    state: &AppState,
+    repository: &str,
+    digest: &str,
+    headers_only: bool,
+) -> Result<Response, AppError> {
+    let blob = state.oci_registry.read_blob(repository, digest).await?;
+    let body = if headers_only {
+        Body::empty()
+    } else {
+        Body::from(blob.content.clone())
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, blob.content.len().to_string())
+        .header("Docker-Content-Digest", blob.digest)
+        .body(body)
+        .map_err(|error| AppError::Internal(format!("failed to build OCI blob response: {error}")))
+}
+
+async fn oci_get_manifest(
+    state: &AppState,
+    repository: &str,
+    reference: &str,
+    headers_only: bool,
+) -> Result<Response, AppError> {
+    let manifest = state
+        .oci_registry
+        .read_manifest(repository, reference)
+        .await?;
+    let body = if headers_only {
+        Body::empty()
+    } else {
+        Body::from(manifest.content.clone())
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, manifest.media_type)
+        .header(header::CONTENT_LENGTH, manifest.content.len().to_string())
+        .header("Docker-Content-Digest", manifest.digest)
+        .body(body)
+        .map_err(|error| {
+            AppError::Internal(format!("failed to build OCI manifest response: {error}"))
+        })
+}
+
+fn oci_upload_response(repository: &str, uuid: &str, size: u64) -> Result<Response, AppError> {
+    let end = size.saturating_sub(1);
+    Response::builder()
+        .status(StatusCode::ACCEPTED)
+        .header("Docker-Upload-UUID", uuid)
+        .header("Location", format!("/v2/{repository}/blobs/uploads/{uuid}"))
+        .header("Range", format!("0-{end}"))
+        .body(Body::empty())
+        .map_err(|error| {
+            AppError::Internal(format!("failed to build OCI upload response: {error}"))
+        })
+}
+
+fn oci_created_response(location: &str, digest: &str) -> Result<Response, AppError> {
+    Response::builder()
+        .status(StatusCode::CREATED)
+        .header("Location", location)
+        .header("Docker-Content-Digest", digest)
+        .body(Body::empty())
+        .map_err(|error| AppError::Internal(format!("failed to build OCI response: {error}")))
+}
+
+fn method_not_allowed() -> Result<Response, AppError> {
+    Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .body(Body::empty())
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "failed to build method-not-allowed response: {error}"
+            ))
+        })
+}
+
+fn authenticate_push(state: &AppState, headers: &HeaderMap) -> Result<SourceClaims, AppError> {
+    let bearer_token = match auth::extract_upload_token(headers) {
+        Ok(token) => Some(token),
+        Err(_error) if !state.subject_validator.auth_enabled() => None,
+        Err(error) => return Err(error),
+    };
+    state.subject_validator.validate(bearer_token.as_deref())
+}
+
+fn split_oci_blob_path(path: &str) -> Option<(&str, &str)> {
+    let (repository, digest) = path.rsplit_once("/blobs/")?;
+    if repository.is_empty() || digest.is_empty() {
+        return None;
+    }
+    Some((repository, digest))
+}
+
+fn split_oci_upload_path(path: &str) -> Option<(&str, &str)> {
+    let (repository, uuid) = path.rsplit_once("/blobs/uploads/")?;
+    if repository.is_empty() || uuid.is_empty() {
+        return None;
+    }
+    Some((repository, uuid))
+}
+
+fn split_oci_upload_start_path(path: &str) -> Option<&str> {
+    path.strip_suffix("/blobs/uploads/")
+        .or_else(|| path.strip_suffix("/blobs/uploads"))
+        .filter(|repository| !repository.is_empty())
+}
+
+fn split_oci_manifest_path(path: &str) -> Option<(&str, &str)> {
+    let (repository, reference) = path.rsplit_once("/manifests/")?;
+    if repository.is_empty() || reference.is_empty() {
+        return None;
+    }
+    Some((repository, reference))
 }
 
 async fn upload_distribution(
@@ -223,6 +478,57 @@ impl AppState {
             )))
         }
     }
+
+    fn authorize_oci_repository(
+        &self,
+        repository: &str,
+        claims: &SourceClaims,
+    ) -> Result<(), AppError> {
+        if !self.subject_validator.auth_enabled() {
+            debug!(
+                repository,
+                "OCI publisher authorization skipped because auth is disabled"
+            );
+            return Ok(());
+        }
+
+        let mut repository_policy_seen = false;
+        for publisher in self.publishers.iter() {
+            if !publisher_allows_oci_repository(publisher, repository) {
+                continue;
+            }
+            repository_policy_seen = true;
+            if let Some((claim_name, required_value)) =
+                claims.first_missing_required_claim(&publisher.required_claims)
+            {
+                debug!(
+                    publisher = %publisher.display_name(),
+                    repository,
+                    claim_name,
+                    required_value,
+                    "OCI publisher policy did not match token claims"
+                );
+                continue;
+            }
+            debug!(
+                publisher = %publisher.display_name(),
+                repository,
+                subject = %claims.subject(),
+                "OCI publisher authorization check passed"
+            );
+            return Ok(());
+        }
+
+        if repository_policy_seen {
+            Err(AppError::Forbidden(format!(
+                "token claims do not satisfy a publisher policy for OCI repository '{repository}'"
+            )))
+        } else {
+            Err(AppError::Forbidden(format!(
+                "no publisher policy allows OCI repository '{repository}'"
+            )))
+        }
+    }
 }
 
 fn publisher_allows_project(publisher: &PublisherConfig, normalized_project: &str) -> bool {
@@ -230,6 +536,13 @@ fn publisher_allows_project(publisher: &PublisherConfig, normalized_project: &st
         .projects
         .iter()
         .any(|project| project == "*" || normalize_name(project).as_str() == normalized_project)
+}
+
+fn publisher_allows_oci_repository(publisher: &PublisherConfig, repository: &str) -> bool {
+    publisher
+        .projects
+        .iter()
+        .any(|project| project == "*" || project == repository)
 }
 
 #[derive(Clone)]
@@ -684,6 +997,7 @@ impl ProjectFileJson {
 mod tests {
     use super::{AppState, SubjectValidator, build_router};
     use crate::config::{AuthenticationConfig, PublisherConfig};
+    use crate::oci::OciRegistry;
     use crate::package::SIMPLE_API_VERSION;
     use crate::repository::PackageRepository;
     use axum::body::{Body, to_bytes};
@@ -880,9 +1194,114 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
+    #[tokio::test]
+    async fn oci_push_then_public_pull_blob_and_manifest() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = authenticated_state(tempdir.path());
+        let app = build_router(state);
+        let token = test_token("builder", "ci");
+        let layer_digest =
+            "sha256:dac1d7cfa95021764849fd102524e141488c5e3a90f861dbb5a12d9ac8584f85";
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v2/team/image/blobs/uploads/?digest={layer_digest}"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from("layer"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()["Docker-Content-Digest"], layer_digest);
+
+        let manifest = r#"{"schemaVersion":2,"layers":[]}"#;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v2/team/image/manifests/latest")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(
+                        header::CONTENT_TYPE,
+                        "application/vnd.oci.image.manifest.v1+json",
+                    )
+                    .body(Body::from(manifest))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let manifest_digest = response.headers()["Docker-Content-Digest"]
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v2/team/image/blobs/{layer_digest}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"layer");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/team/image/manifests/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["Docker-Content-Digest"], manifest_digest);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], manifest.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn oci_push_rejects_jwt_with_wrong_claims() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = authenticated_state(tempdir.path());
+        let app = build_router(state);
+        let token = test_token("builder", "other");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v2/team/image/manifests/latest")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(
+                        header::CONTENT_TYPE,
+                        "application/vnd.oci.image.manifest.v1+json",
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
     fn unauthenticated_state(path: &std::path::Path) -> AppState {
         AppState {
             repository: PackageRepository::new(path),
+            oci_registry: OciRegistry::new(path),
             subject_validator: SubjectValidator::new(AuthenticationConfig::default(), true),
             publishers: Arc::new(Vec::new()),
             max_upload_bytes: 1024 * 1024,
@@ -892,6 +1311,7 @@ mod tests {
     fn authenticated_state(path: &std::path::Path) -> AppState {
         AppState {
             repository: PackageRepository::new(path),
+            oci_registry: OciRegistry::new(path),
             subject_validator: SubjectValidator::new(
                 AuthenticationConfig {
                     audience: "reposnake".to_string(),
@@ -902,7 +1322,7 @@ mod tests {
             ),
             publishers: Arc::new(vec![PublisherConfig {
                 name: "ci".to_string(),
-                projects: vec!["reposnake-demo".to_string()],
+                projects: vec!["reposnake-demo".to_string(), "team/image".to_string()],
                 required_claims: BTreeMap::from([("pipeline".to_string(), "ci".to_string())]),
             }]),
             max_upload_bytes: 1024 * 1024,

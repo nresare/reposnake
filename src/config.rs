@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: The reposnake contributors
 
+use crate::oci::is_valid_repository_name;
 use crate::package::is_valid_project_name;
 use anyhow::Context;
 use serde::Deserialize;
@@ -79,10 +80,10 @@ impl Config {
                 if project == "*" {
                     continue;
                 }
-                if !is_valid_project_name(project) {
+                if !is_valid_project_name(project) && !is_valid_repository_name(project) {
                     let publisher_name = publisher.display_name();
                     anyhow::bail!(
-                        "publisher '{publisher_name}' project '{project}' is not a valid Python project name"
+                        "publisher '{publisher_name}' project '{project}' is not a valid Python project or OCI repository name"
                     );
                 }
             }

@@ -16,7 +16,7 @@ validation_key = """
 
 [[publisher]]
 name = "ci"
-projects = ["example-package"]
+projects = ["example-package", "team/image"]
 
 [publisher.required_claims]
 sub = "system:serviceaccount:build:publisher"

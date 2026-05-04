@@ -1,0 +1,2 @@
+variant = "rust"
+output = "container"

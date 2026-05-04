@@ -129,7 +129,7 @@ async fn package_response(
     filename: &str,
     state: &AppState,
 ) -> Result<Response, AppError> {
-    let (content, _record) = state.repository.read_file(&project, &filename).await?;
+    let (content, _record) = state.repository.read_file(project, filename).await?;
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")

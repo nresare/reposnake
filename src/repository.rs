@@ -2,88 +2,55 @@
 // SPDX-FileCopyrightText: The reposnake contributors
 
 use crate::error::AppError;
+use crate::metadata::{SharedMetadataStore, SurrealMetadataStore};
+use crate::object_store::{FilesystemObjectStore, SharedObjectStore};
 use crate::package::{
     FileRecord, ProjectIndex, ProjectSummary, UploadPackage, is_safe_filename,
     is_valid_project_name, normalize_name,
 };
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PackageRepository {
-    root: Arc<PathBuf>,
+    metadata: SharedMetadataStore,
+    objects: SharedObjectStore,
     write_lock: Arc<Mutex<()>>,
 }
 
+impl std::fmt::Debug for PackageRepository {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PackageRepository")
+            .finish_non_exhaustive()
+    }
+}
+
 impl PackageRepository {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
+    pub async fn new(root: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let root = root.into();
+        let metadata = Arc::new(SurrealMetadataStore::in_memory().await?);
+        let objects = Arc::new(FilesystemObjectStore::new(root.join("objects")));
+        Ok(Self::from_stores(metadata, objects))
+    }
+
+    pub fn from_stores(metadata: SharedMetadataStore, objects: SharedObjectStore) -> Self {
         Self {
-            root: Arc::new(root.into()),
+            metadata,
+            objects,
             write_lock: Arc::new(Mutex::new(())),
         }
     }
 
     pub async fn list_projects(&self) -> Result<Vec<ProjectSummary>, AppError> {
-        let projects_dir = self.projects_dir();
-        if !path_exists(&projects_dir).await? {
-            return Ok(Vec::new());
-        }
-
-        let mut entries = tokio::fs::read_dir(&projects_dir).await.map_err(|error| {
-            AppError::Internal(format!(
-                "failed to list projects in '{}': {error}",
-                projects_dir.display()
-            ))
-        })?;
-        let mut projects = Vec::new();
-
-        while let Some(entry) = entries.next_entry().await.map_err(|error| {
-            AppError::Internal(format!(
-                "failed to read projects in '{}': {error}",
-                projects_dir.display()
-            ))
-        })? {
-            let is_file = entry.file_type().await.map_err(|error| {
-                AppError::Internal(format!(
-                    "failed to inspect project entry '{}': {error}",
-                    entry.path().display()
-                ))
-            })?;
-            if !is_file.is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-                continue;
-            }
-            let project = self.read_project_index_path(&path).await?;
-            projects.push(ProjectSummary {
-                name: project.name,
-                normalized_name: project.normalized_name,
-            });
-        }
-
-        projects.sort_by(|left, right| left.normalized_name.cmp(&right.normalized_name));
-        Ok(projects)
+        self.metadata.list_projects().await
     }
 
     pub async fn project(&self, normalized_project: &str) -> Result<ProjectIndex, AppError> {
         let normalized_project = normalize_name(normalized_project);
-        let path = self.project_index_path(&normalized_project);
-        let mut project = self.read_project_index_path(&path).await.map_err(|error| {
-            if matches!(error, AppError::NotFound(_)) {
-                AppError::NotFound(format!("unknown project '{normalized_project}'"))
-            } else {
-                error
-            }
-        })?;
-        project
-            .files
-            .sort_by(|left, right| left.filename.cmp(&right.filename));
-        Ok(project)
+        self.metadata.project(&normalized_project).await
     }
 
     pub async fn read_file(
@@ -106,15 +73,12 @@ impl PackageRepository {
                     "unknown file '{filename}' for project '{normalized_project}'"
                 ))
             })?;
-        let path = self.package_path(&normalized_project, filename);
-        let content = tokio::fs::read(&path).await.map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
+        let sha256 = sha256_bytes(&record.sha256)?;
+        let content = self.objects.read(&sha256).await.map_err(|error| {
+            if matches!(error, AppError::NotFound(_)) {
                 AppError::NotFound(format!("package file '{filename}' is missing from storage"))
             } else {
-                AppError::Internal(format!(
-                    "failed to read package file '{}': {error}",
-                    path.display()
-                ))
+                error
             }
         })?;
         Ok((content, record))
@@ -142,9 +106,9 @@ impl PackageRepository {
         }
 
         let normalized_project = normalize_name(&upload.name);
-        let sha256 = sha256_hex(&upload.content);
+        let expected_sha256 = sha256_hex(&upload.content);
         if let Some(provided_sha256) = &upload.provided_sha256
-            && !provided_sha256.eq_ignore_ascii_case(&sha256)
+            && !provided_sha256.eq_ignore_ascii_case(&expected_sha256)
         {
             return Err(AppError::BadRequest(
                 "sha256_digest does not match uploaded content".to_string(),
@@ -152,138 +116,42 @@ impl PackageRepository {
         }
 
         let _guard = self.write_lock.lock().await;
-        tokio::fs::create_dir_all(self.projects_dir())
-            .await
-            .map_err(|error| {
-                AppError::Internal(format!("failed to create project storage: {error}"))
-            })?;
-        tokio::fs::create_dir_all(self.package_dir(&normalized_project))
-            .await
-            .map_err(|error| {
-                AppError::Internal(format!("failed to create package storage: {error}"))
-            })?;
-
-        let mut project = match self.read_project_index(&normalized_project).await {
-            Ok(project) => project,
-            Err(AppError::NotFound(_)) => ProjectIndex {
-                name: upload.name.clone(),
-                normalized_name: normalized_project.clone(),
-                files: Vec::new(),
-            },
-            Err(error) => return Err(error),
-        };
-
-        if project
-            .files
-            .iter()
-            .any(|record| record.filename == upload.filename)
-        {
-            return Err(AppError::Conflict(format!(
-                "file '{}' already exists",
-                upload.filename
-            )));
-        }
-
-        let path = self.package_path(&normalized_project, &upload.filename);
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    AppError::Conflict(format!("file '{}' already exists", upload.filename))
-                } else {
-                    AppError::Internal(format!(
-                        "failed to create package file '{}': {error}",
-                        path.display()
-                    ))
-                }
-            })?;
-        file.write_all(&upload.content).await.map_err(|error| {
-            AppError::Internal(format!(
-                "failed to write package file '{}': {error}",
-                path.display()
-            ))
-        })?;
-        file.flush().await.map_err(|error| {
-            AppError::Internal(format!(
-                "failed to flush package file '{}': {error}",
-                path.display()
-            ))
-        })?;
-
         let record = FileRecord {
             filename: upload.filename,
             version: upload.version,
-            sha256,
+            sha256: expected_sha256,
             size: upload.content.len() as u64,
             requires_python: upload.requires_python,
         };
-        project.files.push(record.clone());
-        project
-            .files
-            .sort_by(|left, right| left.filename.cmp(&right.filename));
-        self.write_project_index(&project).await?;
+        let project = ProjectSummary {
+            name: upload.name,
+            normalized_name: normalized_project.clone(),
+        };
+        let mut writer = self.objects.create_writer().await?;
+        if let Err(error) = writer.write_chunk(&upload.content).await {
+            writer.abort().await?;
+            return Err(error);
+        }
+        let stored_sha256 = match writer.commit().await {
+            Ok(stored_sha256) => stored_sha256,
+            Err(error) => return Err(error),
+        };
+        let stored_sha256 = hex::encode(stored_sha256);
+        if stored_sha256 != record.sha256 {
+            return Err(AppError::Internal(format!(
+                "stored object digest '{stored_sha256}' did not match expected digest '{}'",
+                record.sha256
+            )));
+        }
+
+        if let Err(error) = self.metadata.add_file(project, record.clone()).await {
+            self.objects
+                .delete_if_exists(&sha256_bytes(&record.sha256)?)
+                .await?;
+            return Err(error);
+        }
 
         Ok(record)
-    }
-
-    async fn read_project_index(&self, normalized_project: &str) -> Result<ProjectIndex, AppError> {
-        self.read_project_index_path(&self.project_index_path(normalized_project))
-            .await
-    }
-
-    async fn read_project_index_path(&self, path: &Path) -> Result<ProjectIndex, AppError> {
-        let content = tokio::fs::read_to_string(path).await.map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                AppError::NotFound(format!("project index '{}' not found", path.display()))
-            } else {
-                AppError::Internal(format!(
-                    "failed to read project index '{}': {error}",
-                    path.display()
-                ))
-            }
-        })?;
-        serde_json::from_str(&content).map_err(|error| {
-            AppError::Internal(format!(
-                "failed to parse project index '{}': {error}",
-                path.display()
-            ))
-        })
-    }
-
-    async fn write_project_index(&self, project: &ProjectIndex) -> Result<(), AppError> {
-        let path = self.project_index_path(&project.normalized_name);
-        let content = serde_json::to_vec_pretty(project).map_err(|error| {
-            AppError::Internal(format!(
-                "failed to serialize project index '{}': {error}",
-                project.normalized_name
-            ))
-        })?;
-        tokio::fs::write(&path, content).await.map_err(|error| {
-            AppError::Internal(format!(
-                "failed to write project index '{}': {error}",
-                path.display()
-            ))
-        })
-    }
-
-    fn projects_dir(&self) -> PathBuf {
-        self.root.join("projects")
-    }
-
-    fn package_dir(&self, normalized_project: &str) -> PathBuf {
-        self.root.join("packages").join(normalized_project)
-    }
-
-    fn package_path(&self, normalized_project: &str, filename: &str) -> PathBuf {
-        self.package_dir(normalized_project).join(filename)
-    }
-
-    fn project_index_path(&self, normalized_project: &str) -> PathBuf {
-        self.projects_dir()
-            .join(format!("{normalized_project}.json"))
     }
 }
 
@@ -293,14 +161,18 @@ fn sha256_hex(content: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-async fn path_exists(path: &Path) -> Result<bool, AppError> {
-    match tokio::fs::try_exists(path).await {
-        Ok(exists) => Ok(exists),
-        Err(error) => Err(AppError::Internal(format!(
-            "failed to check path '{}': {error}",
-            path.display()
-        ))),
-    }
+fn sha256_bytes(hex_digest: &str) -> Result<[u8; 32], AppError> {
+    let bytes = hex::decode(hex_digest).map_err(|error| {
+        AppError::Internal(format!(
+            "invalid stored sha256 digest '{hex_digest}': {error}"
+        ))
+    })?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        AppError::Internal(format!(
+            "invalid stored sha256 digest '{hex_digest}': expected 32 bytes, got {}",
+            bytes.len()
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -311,7 +183,7 @@ mod tests {
     #[tokio::test]
     async fn stores_and_reads_uploaded_package() {
         let tempdir = tempfile::tempdir().unwrap();
-        let repository = PackageRepository::new(tempdir.path());
+        let repository = PackageRepository::new(tempdir.path()).await.unwrap();
 
         let record = repository
             .store_upload(UploadPackage {
@@ -346,7 +218,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_duplicate_files() {
         let tempdir = tempfile::tempdir().unwrap();
-        let repository = PackageRepository::new(tempdir.path());
+        let repository = PackageRepository::new(tempdir.path()).await.unwrap();
         let upload = UploadPackage {
             name: "reposnake-demo".to_string(),
             version: "0.1.0".to_string(),

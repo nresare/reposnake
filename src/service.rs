@@ -36,9 +36,9 @@ pub struct AppState {
     pub max_upload_bytes: usize,
 }
 
-pub fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Result<AppState> {
+pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Result<AppState> {
     Ok(AppState {
-        repository: PackageRepository::new(config.storage_directory.clone()),
+        repository: PackageRepository::new(config.storage_directory.clone()).await?,
         oci_registry: OciRegistry::new(config.storage_directory.clone()),
         subject_validator: SubjectValidator::new(config.authentication.clone(), disable_auth),
         publishers: Arc::new(config.publishers.clone()),
@@ -1013,7 +1013,7 @@ mod tests {
     #[tokio::test]
     async fn upload_then_serves_simple_html_and_package() {
         let tempdir = tempfile::tempdir().unwrap();
-        let state = unauthenticated_state(tempdir.path());
+        let state = unauthenticated_state(tempdir.path()).await;
         let app = build_router(state);
         let body = multipart_upload_body("reposnake_demo", "0.1.0", b"package-content");
 
@@ -1073,7 +1073,7 @@ mod tests {
     #[tokio::test]
     async fn simple_json_uses_relative_artifact_basenames() {
         let tempdir = tempfile::tempdir().unwrap();
-        let state = unauthenticated_state(tempdir.path());
+        let state = unauthenticated_state(tempdir.path()).await;
         let app = build_router(state);
 
         let response = app
@@ -1117,7 +1117,7 @@ mod tests {
     #[tokio::test]
     async fn simple_prefix_is_not_a_compatibility_index() {
         let tempdir = tempfile::tempdir().unwrap();
-        let state = unauthenticated_state(tempdir.path());
+        let state = unauthenticated_state(tempdir.path()).await;
         let app = build_router(state);
 
         let response = app
@@ -1136,7 +1136,7 @@ mod tests {
     #[tokio::test]
     async fn upload_accepts_jwt_as_basic_password() {
         let tempdir = tempfile::tempdir().unwrap();
-        let state = authenticated_state(tempdir.path());
+        let state = authenticated_state(tempdir.path()).await;
         let app = build_router(state);
         let token = test_token("builder", "ci");
         let credentials = general_purpose::STANDARD.encode(format!("__token__:{token}"));
@@ -1167,7 +1167,7 @@ mod tests {
     #[tokio::test]
     async fn upload_rejects_jwt_with_wrong_claims() {
         let tempdir = tempfile::tempdir().unwrap();
-        let state = authenticated_state(tempdir.path());
+        let state = authenticated_state(tempdir.path()).await;
         let app = build_router(state);
         let token = test_token("builder", "other");
 
@@ -1197,7 +1197,7 @@ mod tests {
     #[tokio::test]
     async fn oci_push_then_public_pull_blob_and_manifest() {
         let tempdir = tempfile::tempdir().unwrap();
-        let state = authenticated_state(tempdir.path());
+        let state = authenticated_state(tempdir.path()).await;
         let app = build_router(state);
         let token = test_token("builder", "ci");
         let layer_digest =
@@ -1275,7 +1275,7 @@ mod tests {
     #[tokio::test]
     async fn oci_push_rejects_jwt_with_wrong_claims() {
         let tempdir = tempfile::tempdir().unwrap();
-        let state = authenticated_state(tempdir.path());
+        let state = authenticated_state(tempdir.path()).await;
         let app = build_router(state);
         let token = test_token("builder", "other");
 
@@ -1298,9 +1298,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
-    fn unauthenticated_state(path: &std::path::Path) -> AppState {
+    async fn unauthenticated_state(path: &std::path::Path) -> AppState {
         AppState {
-            repository: PackageRepository::new(path),
+            repository: PackageRepository::new(path).await.unwrap(),
             oci_registry: OciRegistry::new(path),
             subject_validator: SubjectValidator::new(AuthenticationConfig::default(), true),
             publishers: Arc::new(Vec::new()),
@@ -1308,9 +1308,9 @@ mod tests {
         }
     }
 
-    fn authenticated_state(path: &std::path::Path) -> AppState {
+    async fn authenticated_state(path: &std::path::Path) -> AppState {
         AppState {
-            repository: PackageRepository::new(path),
+            repository: PackageRepository::new(path).await.unwrap(),
             oci_registry: OciRegistry::new(path),
             subject_validator: SubjectValidator::new(
                 AuthenticationConfig {

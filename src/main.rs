@@ -19,7 +19,7 @@ struct Cli {
         name = "config-file",
         short = 'c',
         long = "config-file",
-        default_value = "/config"
+        default_value = "/config/reposnake.toml"
     )]
     config_path: String,
     #[arg(long = "disable-auth", default_value_t = false)]
@@ -64,7 +64,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         "starting reposnake"
     );
 
-    let state = build_app_state(&config, cli.disable_auth)?;
+    let state = build_app_state(&config, cli.disable_auth).await?;
     let app: Router = build_router(state);
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
     info!(address = %bind_address, "listening");

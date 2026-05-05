@@ -193,37 +193,36 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     #[tokio::test]
-    async fn writer_commits_by_content_digest_and_deduplicates() {
-        let tempdir = tempfile::tempdir().unwrap();
+    async fn writer_commits_by_content_digest_and_deduplicates() -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
         let store = FilesystemObjectStore::new(tempdir.path());
         let content = b"package-content";
         let expected: [u8; 32] = Sha256::digest(content).into();
 
-        let mut writer = store.create_writer().await.unwrap();
-        writer.write_chunk(b"package-").await.unwrap();
-        writer.write_chunk(b"content").await.unwrap();
-        let digest = writer.commit().await.unwrap();
+        let mut writer = store.create_writer().await?;
+        writer.write_chunk(b"package-").await?;
+        writer.write_chunk(b"content").await?;
+        let digest = writer.commit().await?;
 
         assert_eq!(digest, expected);
         assert_eq!(
-            tokio::fs::read(tempdir.path().join(hex::encode(expected)))
-                .await
-                .unwrap(),
+            tokio::fs::read(tempdir.path().join(hex::encode(expected))).await?,
             content
         );
 
-        let mut duplicate = store.create_writer().await.unwrap();
-        duplicate.write_chunk(content).await.unwrap();
-        let duplicate_digest = duplicate.commit().await.unwrap();
+        let mut duplicate = store.create_writer().await?;
+        duplicate.write_chunk(content).await?;
+        let duplicate_digest = duplicate.commit().await?;
 
         assert_eq!(duplicate_digest, expected);
-        let mut entries = tokio::fs::read_dir(tempdir.path()).await.unwrap();
+        let mut entries = tokio::fs::read_dir(tempdir.path()).await?;
         let mut object_count = 0;
-        while let Some(entry) = entries.next_entry().await.unwrap() {
-            if entry.file_type().await.unwrap().is_file() {
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_file() {
                 object_count += 1;
             }
         }
         assert_eq!(object_count, 1);
+        Ok(())
     }
 }

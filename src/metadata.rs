@@ -168,3 +168,122 @@ impl MetadataStore for SurrealMetadataStore {
 fn file_id(normalized_project: &str, filename: &str) -> String {
     format!("{normalized_project}/{filename}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{MetadataStore, SurrealMetadataStore};
+    use crate::error::AppError;
+    use crate::package::{FileRecord, ProjectSummary};
+
+    #[tokio::test]
+    async fn embedded_store_starts_with_no_projects() -> anyhow::Result<()> {
+        let store = SurrealMetadataStore::in_memory().await?;
+
+        assert!(store.list_projects().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn embedded_store_adds_and_reads_simple_project_detail() -> anyhow::Result<()> {
+        let store = SurrealMetadataStore::in_memory().await?;
+        store
+            .add_file(
+                project("reposnake-demo"),
+                file("demo-0.1.0.tar.gz", "0.1.0"),
+            )
+            .await?;
+
+        let project = store.project("reposnake-demo").await?;
+
+        assert_eq!(project.name, "reposnake-demo");
+        assert_eq!(project.normalized_name, "reposnake-demo");
+        assert_eq!(project.files.len(), 1);
+        assert_eq!(project.files[0].filename, "demo-0.1.0.tar.gz");
+        assert_eq!(project.files[0].requires_python.as_deref(), Some(">=3.11"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn embedded_store_lists_projects_and_files_in_simple_api_order() -> anyhow::Result<()> {
+        let store = SurrealMetadataStore::in_memory().await?;
+        store
+            .add_file(
+                project("zebra-project"),
+                file("zebra-0.1.0.tar.gz", "0.1.0"),
+            )
+            .await?;
+        store
+            .add_file(
+                project("alpha-project"),
+                file("alpha-0.2.0.tar.gz", "0.2.0"),
+            )
+            .await?;
+        store
+            .add_file(
+                project("alpha-project"),
+                file("alpha-0.1.0.tar.gz", "0.1.0"),
+            )
+            .await?;
+
+        let projects = store.list_projects().await?;
+        let alpha = store.project("alpha-project").await?;
+
+        assert_eq!(
+            projects
+                .iter()
+                .map(|project| project.normalized_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha-project", "zebra-project"]
+        );
+        assert_eq!(
+            alpha
+                .files
+                .iter()
+                .map(|file| file.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha-0.1.0.tar.gz", "alpha-0.2.0.tar.gz"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn embedded_store_rejects_duplicate_file_for_project() -> anyhow::Result<()> {
+        let store = SurrealMetadataStore::in_memory().await?;
+        let project = project("reposnake-demo");
+        let file = file("demo-0.1.0.tar.gz", "0.1.0");
+
+        store.add_file(project.clone(), file.clone()).await?;
+        let error = store.add_file(project, file).await.unwrap_err();
+
+        assert!(matches!(error, AppError::Conflict(_)));
+        assert_eq!(error.to_string(), "file 'demo-0.1.0.tar.gz' already exists");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn embedded_store_returns_not_found_for_unknown_project() -> anyhow::Result<()> {
+        let store = SurrealMetadataStore::in_memory().await?;
+        let error = store.project("missing-project").await.unwrap_err();
+
+        assert!(matches!(error, AppError::NotFound(_)));
+        assert_eq!(error.to_string(), "unknown project 'missing-project'");
+        Ok(())
+    }
+
+    fn project(normalized_name: &str) -> ProjectSummary {
+        ProjectSummary {
+            name: normalized_name.to_string(),
+            normalized_name: normalized_name.to_string(),
+        }
+    }
+
+    fn file(filename: &str, version: &str) -> FileRecord {
+        FileRecord {
+            filename: filename.to_string(),
+            version: version.to_string(),
+            sha256: "a3da3fb94769c68c9f728842a4a00408ad28c5f734b093d23cc4d62f51079589".to_string(),
+            size: 15,
+            requires_python: Some(">=3.11".to_string()),
+        }
+    }
+}

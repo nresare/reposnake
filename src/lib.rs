@@ -5,6 +5,8 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod kubernetes;
+pub mod metadata;
+pub mod object_store;
 pub mod oci;
 pub mod package;
 pub mod repository;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: The reposnake contributors
 
+use crate::config::PersistenceConfig;
 use crate::error::AppError;
 use crate::package::{FileRecord, ProjectIndex, ProjectSummary};
 use async_trait::async_trait;
@@ -8,7 +9,11 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 use surrealdb::Surreal;
-use surrealdb::engine::local::{Db, Mem};
+use surrealdb::engine::any;
+use surrealdb::engine::any::Any;
+
+const NAMESPACE: &str = "reposnake";
+const DATABASE: &str = "metadata";
 
 pub type SharedMetadataStore = Arc<dyn MetadataStore>;
 
@@ -21,7 +26,7 @@ pub trait MetadataStore: fmt::Debug + Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct SurrealMetadataStore {
-    db: Surreal<Db>,
+    db: Arc<Surreal<Any>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,11 +47,66 @@ struct FileDoc {
 
 impl SurrealMetadataStore {
     pub async fn in_memory() -> anyhow::Result<Self> {
-        let db = Surreal::new::<Mem>(()).await?;
-        db.use_ns("reposnake").use_db("metadata").await?;
-        Ok(Self { db })
+        Ok(Self::new(mem_db().await?))
     }
 
+    pub async fn from_config(config: &PersistenceConfig) -> anyhow::Result<Self> {
+        Ok(Self::new(make_db(config).await?))
+    }
+
+    pub fn new(db: Arc<Surreal<Any>>) -> Self {
+        Self { db }
+    }
+
+    pub async fn make_db(config: &PersistenceConfig) -> anyhow::Result<Arc<Surreal<Any>>> {
+        make_db(config).await
+    }
+
+    pub async fn mem_db() -> anyhow::Result<Arc<Surreal<Any>>> {
+        mem_db().await
+    }
+}
+
+pub async fn make_db(config: &PersistenceConfig) -> anyhow::Result<Arc<Surreal<Any>>> {
+    let db = Arc::new(any::connect(&config.uri).await?);
+    if let (Some(username), Some(password)) = (&config.username, config.password()?) {
+        db.signin(surrealdb::opt::auth::Database {
+            namespace: NAMESPACE,
+            database: DATABASE,
+            username,
+            password: &password,
+        })
+        .await?;
+    }
+    setup_db(db.as_ref()).await?;
+    Ok(db)
+}
+
+#[cfg(test)]
+pub async fn mem_db() -> anyhow::Result<Arc<Surreal<Any>>> {
+    let db = Arc::new(any::connect("mem://").await?);
+    setup_db(db.as_ref()).await?;
+    Ok(db)
+}
+
+#[cfg(not(test))]
+async fn mem_db() -> anyhow::Result<Arc<Surreal<Any>>> {
+    let db = Arc::new(any::connect("mem://").await?);
+    setup_db(db.as_ref()).await?;
+    Ok(db)
+}
+
+async fn setup_db(db: &Surreal<Any>) -> anyhow::Result<()> {
+    db.use_ns(NAMESPACE).use_db(DATABASE).await?;
+    db.query(
+        "DEFINE INDEX IF NOT EXISTS packageFileByProjectFilename \
+         ON package_file FIELDS normalized_project, filename UNIQUE;",
+    )
+    .await?;
+    Ok(())
+}
+
+impl SurrealMetadataStore {
     async fn files_for_project(
         &self,
         normalized_project: &str,

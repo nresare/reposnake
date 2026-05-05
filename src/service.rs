@@ -38,7 +38,11 @@ pub struct AppState {
 
 pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Result<AppState> {
     Ok(AppState {
-        repository: PackageRepository::new(config.storage_directory.clone()).await?,
+        repository: PackageRepository::from_config(
+            config.storage_directory.clone(),
+            &config.persistence,
+        )
+        .await?,
         oci_registry: OciRegistry::new(config.storage_directory.clone()),
         subject_validator: SubjectValidator::new(config.authentication.clone(), disable_auth),
         publishers: Arc::new(config.publishers.clone()),

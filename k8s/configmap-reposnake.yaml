@@ -8,6 +8,9 @@ data:
     storage_directory = "/data"
     max_upload_bytes = 104857600
 
+    [persistence]
+    uri = "mem://"
+
     [authentication]
     audience = "reposnake"
     issuer = "https://issuer.example"

@@ -6,6 +6,7 @@ use crate::package::is_valid_project_name;
 use anyhow::Context;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -16,6 +17,8 @@ pub struct Config {
     pub storage_directory: PathBuf,
     #[serde(default = "default_max_upload_bytes")]
     pub max_upload_bytes: usize,
+    #[serde(default)]
+    pub persistence: PersistenceConfig,
     #[serde(default)]
     pub authentication: AuthenticationConfig,
     #[serde(rename = "publisher", default)]
@@ -40,6 +43,14 @@ pub struct PublisherConfig {
     pub required_claims: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct PersistenceConfig {
+    #[serde(default = "default_persistence_uri")]
+    pub uri: String,
+    pub username: Option<String>,
+    password_file: Option<Box<Path>>,
+}
+
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -58,6 +69,7 @@ impl Config {
         if self.max_upload_bytes == 0 {
             anyhow::bail!("max_upload_bytes must be greater than 0");
         }
+        self.persistence.validate()?;
         if !disable_auth {
             self.authentication.validate()?;
             if self.publishers.is_empty() {
@@ -90,6 +102,39 @@ impl Config {
         }
 
         Ok(())
+    }
+}
+
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        Self {
+            uri: default_persistence_uri(),
+            username: None,
+            password_file: None,
+        }
+    }
+}
+
+impl PersistenceConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.uri.is_empty() {
+            anyhow::bail!("persistence.uri must not be empty");
+        }
+        match (&self.username, &self.password_file) {
+            (Some(username), Some(_)) if !username.is_empty() => {}
+            (None, None) => {}
+            _ => anyhow::bail!(
+                "persistence.username and persistence.password_file must be set together"
+            ),
+        }
+        Ok(())
+    }
+
+    pub fn password(&self) -> anyhow::Result<Option<String>> {
+        let Some(password_file) = self.password_file.as_deref() else {
+            return Ok(None);
+        };
+        Ok(Some(read_secret_file(password_file)?))
     }
 }
 
@@ -132,9 +177,22 @@ fn default_max_upload_bytes() -> usize {
     100 * 1024 * 1024
 }
 
+fn default_persistence_uri() -> String {
+    "mem://".to_string()
+}
+
+fn read_secret_file(path: &Path) -> anyhow::Result<String> {
+    let mut secret = std::fs::read_to_string(path)
+        .with_context(|| format!("Could not read secret file '{}'", path.display()))?;
+    let len = secret.trim_end_matches(['\r', '\n']).len();
+    secret.truncate(len);
+    Ok(secret)
+}
+
 #[cfg(test)]
 mod tests {
     use super::Config;
+    use std::io::Write;
 
     #[test]
     fn parses_minimal_authenticated_config() {
@@ -160,6 +218,51 @@ sub = "buildkite:deploy"
         config.validate(false).unwrap();
         assert_eq!(config.bind_address, "0.0.0.0:8080");
         assert_eq!(config.max_upload_bytes, 100 * 1024 * 1024);
+        assert_eq!(config.persistence.uri, "mem://");
+    }
+
+    #[test]
+    fn parses_persistence_config() {
+        let config: Config = toml::from_str(
+            r#"
+[persistence]
+uri = "ws://localhost:8000/"
+username = "reposnake"
+password_file = "/run/secrets/surrealdb-password"
+
+[[publisher]]
+projects = ["*"]
+"#,
+        )
+        .unwrap();
+
+        config.validate(true).unwrap();
+        assert_eq!(config.persistence.uri, "ws://localhost:8000/");
+        assert_eq!(config.persistence.username.as_deref(), Some("reposnake"));
+    }
+
+    #[test]
+    fn persistence_password_reads_and_trims_secret_file() {
+        let mut password_file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(password_file, "secret").unwrap();
+        let config: Config = toml::from_str(&format!(
+            r#"
+[persistence]
+uri = "ws://localhost:8000/"
+username = "reposnake"
+password_file = "{}"
+
+[[publisher]]
+projects = ["*"]
+"#,
+            password_file.path().display()
+        ))
+        .unwrap();
+
+        assert_eq!(
+            config.persistence.password().unwrap().as_deref(),
+            Some("secret")
+        );
     }
 
     #[test]

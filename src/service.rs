@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: The reposnake contributors
 
 use crate::auth;
-use crate::config::{AuthenticationConfig, Config, PublisherConfig};
+use crate::config::{Config, IdentityProviderConfig, PublisherConfig};
 use crate::error::AppError;
 use crate::oci::{DOCKER_DISTRIBUTION_API_VERSION, OciRegistry};
 use crate::package::{
@@ -44,7 +44,7 @@ pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Res
         )
         .await?,
         oci_registry: OciRegistry::new(config.storage_directory.clone()),
-        subject_validator: SubjectValidator::new(config.authentication.clone(), disable_auth),
+        subject_validator: SubjectValidator::new(config.identity_providers.clone(), disable_auth),
         publishers: Arc::new(config.publishers.clone()),
         max_upload_bytes: config.max_upload_bytes,
     })
@@ -450,6 +450,9 @@ impl AppState {
             if !publisher_allows_project(publisher, normalized_project) {
                 continue;
             }
+            if !claims.matches_identity_provider(publisher.identity_provider.as_deref()) {
+                continue;
+            }
             project_policy_seen = true;
             if let Some((claim_name, required_value)) =
                 claims.first_missing_required_claim(&publisher.required_claims)
@@ -499,6 +502,9 @@ impl AppState {
         let mut repository_policy_seen = false;
         for publisher in self.publishers.iter() {
             if !publisher_allows_oci_repository(publisher, repository) {
+                continue;
+            }
+            if !claims.matches_identity_provider(publisher.identity_provider.as_deref()) {
                 continue;
             }
             repository_policy_seen = true;
@@ -557,11 +563,13 @@ pub struct SubjectValidator {
 #[derive(Clone)]
 enum SubjectValidationMode {
     Disabled,
-    Enabled(AuthenticationConfig),
+    Enabled(BTreeMap<String, IdentityProviderConfig>),
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SourceClaims {
+    #[serde(skip)]
+    identity_provider: Option<String>,
     sub: String,
     #[serde(flatten)]
     claims: BTreeMap<String, Value>,
@@ -570,6 +578,7 @@ pub struct SourceClaims {
 impl SourceClaims {
     fn unauthenticated() -> Self {
         Self {
+            identity_provider: None,
             sub: "unauthenticated".to_string(),
             claims: BTreeMap::new(),
         }
@@ -597,32 +606,63 @@ impl SourceClaims {
         }
         self.claims.get(claim_name).and_then(Value::as_str)
     }
+
+    fn matches_identity_provider(&self, identity_provider: Option<&str>) -> bool {
+        self.identity_provider.as_deref() == identity_provider
+    }
 }
 
 impl SubjectValidator {
-    pub fn new(authentication: AuthenticationConfig, disable_auth: bool) -> Self {
+    pub fn new(identity_providers: Vec<IdentityProviderConfig>, disable_auth: bool) -> Self {
         let mode = if disable_auth {
             SubjectValidationMode::Disabled
         } else {
-            SubjectValidationMode::Enabled(authentication)
+            let identity_providers = identity_providers
+                .into_iter()
+                .map(|identity_provider| (identity_provider.name.clone(), identity_provider))
+                .collect();
+            SubjectValidationMode::Enabled(identity_providers)
         };
         Self { mode }
     }
 
     pub fn validate(&self, bearer_token: Option<&str>) -> Result<SourceClaims, AppError> {
-        let authentication = match &self.mode {
+        let identity_providers = match &self.mode {
             SubjectValidationMode::Disabled => {
                 debug!("upload token claim validation skipped because auth is disabled");
                 return Ok(SourceClaims::unauthenticated());
             }
-            SubjectValidationMode::Enabled(authentication) => authentication,
+            SubjectValidationMode::Enabled(identity_providers) => identity_providers,
         };
         let bearer_token = bearer_token
             .ok_or_else(|| AppError::Unauthorized("missing Authorization header".to_string()))?;
+        let mut last_error = None;
+        for authentication in identity_providers.values() {
+            match self.validate_with_provider(authentication, bearer_token) {
+                Ok(mut claims) => {
+                    claims.identity_provider = Some(authentication.name.clone());
+                    return Ok(claims);
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            AppError::Unauthorized("no identity providers configured".to_string())
+        }))
+    }
+
+    fn validate_with_provider(
+        &self,
+        authentication: &IdentityProviderConfig,
+        bearer_token: &str,
+    ) -> Result<SourceClaims, AppError> {
         let (algorithm, decoding_key) =
             auth::decoding_key_for_token(authentication, bearer_token).map_err(AppError::from)?;
         debug!(
             algorithm = ?algorithm,
+            identity_provider = %authentication.name,
             audience = %authentication.audience,
             issuer = %authentication.issuer,
             "validating upload token claims"
@@ -635,7 +675,11 @@ impl SubjectValidator {
             decode::<SourceClaims>(bearer_token, &decoding_key, &validation).map_err(|error| {
                 AppError::Unauthorized(format!("failed to validate upload token: {error}"))
             })?;
-        debug!(subject = %decoded.claims.sub, "upload token claims validated");
+        debug!(
+            identity_provider = %authentication.name,
+            subject = %decoded.claims.sub,
+            "upload token claims validated"
+        );
         Ok(decoded.claims)
     }
 
@@ -1000,7 +1044,7 @@ impl ProjectFileJson {
 #[cfg(test)]
 mod tests {
     use super::{AppState, SubjectValidator, build_router};
-    use crate::config::{AuthenticationConfig, PublisherConfig};
+    use crate::config::{IdentityProviderConfig, PublisherConfig};
     use crate::oci::OciRegistry;
     use crate::package::SIMPLE_API_VERSION;
     use crate::repository::PackageRepository;
@@ -1306,7 +1350,7 @@ mod tests {
         AppState {
             repository: PackageRepository::new(path).await.unwrap(),
             oci_registry: OciRegistry::new(path),
-            subject_validator: SubjectValidator::new(AuthenticationConfig::default(), true),
+            subject_validator: SubjectValidator::new(Vec::new(), true),
             publishers: Arc::new(Vec::new()),
             max_upload_bytes: 1024 * 1024,
         }
@@ -1317,16 +1361,18 @@ mod tests {
             repository: PackageRepository::new(path).await.unwrap(),
             oci_registry: OciRegistry::new(path),
             subject_validator: SubjectValidator::new(
-                AuthenticationConfig {
+                vec![IdentityProviderConfig {
+                    name: "buildkite".to_string(),
                     audience: "reposnake".to_string(),
                     issuer: "https://issuer.example".to_string(),
                     validation_key: Some("shared-secret".to_string()),
-                },
+                }],
                 false,
             ),
             publishers: Arc::new(vec![PublisherConfig {
                 name: "ci".to_string(),
                 projects: vec!["reposnake-demo".to_string(), "team/image".to_string()],
+                identity_provider: Some("buildkite".to_string()),
                 required_claims: BTreeMap::from([("pipeline".to_string(), "ci".to_string())]),
             }]),
             max_upload_bytes: 1024 * 1024,

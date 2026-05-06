@@ -6,6 +6,7 @@ use crate::package::is_valid_project_name;
 use anyhow::Context;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -19,14 +20,16 @@ pub struct Config {
     pub max_upload_bytes: usize,
     #[serde(default)]
     pub persistence: PersistenceConfig,
-    #[serde(default)]
-    pub authentication: AuthenticationConfig,
+    #[serde(rename = "identity-provider", default)]
+    pub identity_providers: Vec<IdentityProviderConfig>,
     #[serde(rename = "publisher", default)]
     pub publishers: Vec<PublisherConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct AuthenticationConfig {
+pub struct IdentityProviderConfig {
+    #[serde(default)]
+    pub name: String,
     #[serde(default)]
     pub audience: String,
     #[serde(default)]
@@ -39,6 +42,8 @@ pub struct PublisherConfig {
     #[serde(default)]
     pub name: String,
     pub projects: Vec<String>,
+    #[serde(rename = "identity-provider")]
+    pub identity_provider: Option<String>,
     #[serde(default)]
     pub required_claims: BTreeMap<String, String>,
 }
@@ -78,13 +83,42 @@ impl Config {
         }
         self.persistence.validate()?;
         if !disable_auth {
-            self.authentication.validate()?;
+            if self.identity_providers.is_empty() {
+                anyhow::bail!("at least one [[identity-provider]] entry is required");
+            }
             if self.publishers.is_empty() {
                 anyhow::bail!("at least one [[publisher]] entry is required");
             }
         }
 
+        let mut identity_provider_names = HashSet::new();
+        for identity_provider in &self.identity_providers {
+            identity_provider.validate()?;
+            if !identity_provider_names.insert(identity_provider.name.clone()) {
+                anyhow::bail!("duplicate identity-provider '{}'", identity_provider.name);
+            }
+        }
+
         for publisher in &self.publishers {
+            if !disable_auth {
+                let publisher_name = publisher.display_name();
+                let identity_provider =
+                    publisher.identity_provider.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "publisher '{publisher_name}' must define identity-provider"
+                        )
+                    })?;
+                if identity_provider.is_empty() {
+                    anyhow::bail!(
+                        "publisher '{publisher_name}' identity-provider must not be empty"
+                    );
+                }
+                if !identity_provider_names.contains(identity_provider) {
+                    anyhow::bail!(
+                        "publisher '{publisher_name}' references unknown identity-provider '{identity_provider}'"
+                    );
+                }
+            }
             if !disable_auth && publisher.required_claims.is_empty() {
                 let publisher_name = publisher.display_name();
                 anyhow::bail!(
@@ -171,18 +205,27 @@ impl IdmouseConfig {
     }
 }
 
-impl AuthenticationConfig {
+impl IdentityProviderConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.name.is_empty() {
+            anyhow::bail!("identity-provider names must not be empty");
+        }
         if self.audience.is_empty() {
-            anyhow::bail!("authentication.audience must not be empty");
+            anyhow::bail!(
+                "identity-provider '{}' audience must not be empty",
+                self.name
+            );
         }
         if self.issuer.is_empty() {
-            anyhow::bail!("authentication.issuer must not be empty");
+            anyhow::bail!("identity-provider '{}' issuer must not be empty", self.name);
         }
         match self.validation_key.as_deref() {
             Some(validation_key) if !validation_key.is_empty() => {}
             None => {}
-            _ => anyhow::bail!("authentication.validation_key must not be empty"),
+            _ => anyhow::bail!(
+                "identity-provider '{}' validation_key must not be empty",
+                self.name
+            ),
         }
         Ok(())
     }
@@ -233,7 +276,8 @@ mod tests {
             r#"
 storage_directory = "/tmp/reposnake"
 
-[authentication]
+[[identity-provider]]
+name = "buildkite"
 audience = "reposnake"
 issuer = "https://issuer.example"
 validation_key = "shared-secret"
@@ -241,6 +285,7 @@ validation_key = "shared-secret"
 [[publisher]]
 name = "ci"
 projects = ["reposnake-demo", "other_demo"]
+identity-provider = "buildkite"
 
 [publisher.required_claims]
 sub = "buildkite:deploy"
@@ -252,6 +297,7 @@ sub = "buildkite:deploy"
         assert_eq!(config.bind_address, "0.0.0.0:8080");
         assert_eq!(config.max_upload_bytes, 100 * 1024 * 1024);
         assert_eq!(config.persistence.uri, "mem://");
+        assert_eq!(config.identity_providers[0].name, "buildkite");
     }
 
     #[test]
@@ -364,13 +410,33 @@ projects = ["*"]
     }
 
     #[test]
+    fn rejects_missing_identity_provider_when_auth_is_enabled() {
+        let config: Config = toml::from_str(
+            r#"
+[[publisher]]
+projects = ["*"]
+
+[publisher.required_claims]
+sub = "buildkite:deploy"
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate(false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "at least one [[identity-provider]] entry is required"
+        );
+    }
+
+    #[test]
     fn rejects_missing_publisher_policy_when_auth_is_enabled() {
         let config: Config = toml::from_str(
             r#"
-[authentication]
+[[identity-provider]]
+name = "buildkite"
 audience = "reposnake"
 issuer = "https://issuer.example"
-validation_key = "shared-secret"
 "#,
         )
         .unwrap();
@@ -386,12 +452,14 @@ validation_key = "shared-secret"
     fn validation_key_is_optional_when_auth_is_enabled() {
         let config: Config = toml::from_str(
             r#"
-[authentication]
+[[identity-provider]]
+name = "buildkite"
 audience = "reposnake"
 issuer = "https://issuer.example"
 
 [[publisher]]
 projects = ["*"]
+identity-provider = "buildkite"
 
 [publisher.required_claims]
 sub = "buildkite:deploy"
@@ -400,5 +468,31 @@ sub = "buildkite:deploy"
         .unwrap();
 
         config.validate(false).unwrap();
+    }
+
+    #[test]
+    fn rejects_publisher_with_unknown_identity_provider() {
+        let config: Config = toml::from_str(
+            r#"
+[[identity-provider]]
+name = "kubernetes"
+audience = "reposnake"
+issuer = "https://kubernetes.default.svc"
+
+[[publisher]]
+projects = ["*"]
+identity-provider = "buildkite"
+
+[publisher.required_claims]
+sub = "buildkite:deploy"
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate(false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "publisher '<unnamed>' references unknown identity-provider 'buildkite'"
+        );
     }
 }

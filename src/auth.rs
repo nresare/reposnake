@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: The reposnake contributors
 
-use crate::config::AuthenticationConfig;
+use crate::config::IdentityProviderConfig;
 use crate::error::AppError;
 use crate::kubernetes;
 use anyhow::Context;
@@ -15,7 +15,7 @@ use serde::Deserialize;
 use tracing::{debug, info};
 
 pub fn decoding_key_for_token(
-    authentication: &AuthenticationConfig,
+    authentication: &IdentityProviderConfig,
     bearer_token: &str,
 ) -> anyhow::Result<(Algorithm, DecodingKey)> {
     install_jwt_crypto_provider();
@@ -27,7 +27,7 @@ pub fn decoding_key_for_token(
         None => {
             info!(
                 issuer = %authentication.issuer,
-                "authentication.validation_key not configured; attempting issuer-based validation key discovery"
+                "identity-provider.validation_key not configured; attempting issuer-based validation key discovery"
             );
             discovery_decoding_key(authentication, bearer_token, algorithm)?
         }
@@ -71,7 +71,7 @@ fn looks_like_pem(value: &str) -> bool {
 }
 
 fn discovery_decoding_key(
-    authentication: &AuthenticationConfig,
+    authentication: &IdentityProviderConfig,
     bearer_token: &str,
     algorithm: Algorithm,
 ) -> anyhow::Result<DecodingKey> {
@@ -155,7 +155,7 @@ fn discovery_decoding_key(
     Ok(decoding_key)
 }
 
-fn discovery_client(authentication: &AuthenticationConfig) -> anyhow::Result<Client> {
+fn discovery_client(authentication: &IdentityProviderConfig) -> anyhow::Result<Client> {
     let mut builder = Client::builder();
 
     if kubernetes::is_kubernetes_service_issuer(&authentication.issuer) {
@@ -310,7 +310,7 @@ fn non_empty_token(token: &str, message: &str) -> Result<String, AppError> {
 #[cfg(test)]
 mod tests {
     use super::{decoding_key_for_token, extract_upload_token, select_jwk_for_token};
-    use crate::config::AuthenticationConfig;
+    use crate::config::IdentityProviderConfig;
     use axum::http::{HeaderMap, HeaderValue, header};
     use base64::Engine;
     use base64::engine::general_purpose;
@@ -346,7 +346,8 @@ mod tests {
 
     #[test]
     fn uses_algorithm_from_token_header() {
-        let authentication = AuthenticationConfig {
+        let authentication = IdentityProviderConfig {
+            name: "buildkite".to_string(),
             audience: "reposnake".to_string(),
             issuer: "https://issuer.example".to_string(),
             validation_key: Some("shared-secret".to_string()),
@@ -360,7 +361,8 @@ mod tests {
 
     #[test]
     fn rejects_hmac_tokens_when_validation_key_is_pem() {
-        let authentication = AuthenticationConfig {
+        let authentication = IdentityProviderConfig {
+            name: "buildkite".to_string(),
             audience: "reposnake".to_string(),
             issuer: "https://issuer.example".to_string(),
             validation_key: Some(

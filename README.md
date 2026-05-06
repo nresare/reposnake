@@ -24,7 +24,8 @@ uri = "mem://"
 # url = "http://idmouse.example/token"
 # token_path = "/run/secrets/idmouse-bearer-token"
 
-[authentication]
+[[identity-provider]]
+name = "kubernetes"
 audience = "reposnake"
 issuer = "https://issuer.example"
 
@@ -39,6 +40,7 @@ validation_key = """
 [[publisher]]
 name = "ci"
 projects = ["example-package", "other_package"]
+identity-provider = "kubernetes"
 
 [publisher.required_claims]
 sub = "system:serviceaccount:build:publisher"

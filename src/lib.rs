@@ -11,4 +11,6 @@ pub mod object_store;
 pub mod oci;
 pub mod package;
 pub mod repository;
+#[cfg(feature = "s3")]
+pub mod s3_object_store;
 pub mod service;

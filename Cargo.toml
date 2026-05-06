@@ -4,9 +4,15 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[features]
+default = ["s3"]
+s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+aws-config = { version = "1.8", optional = true }
+aws-sdk-s3 = { version = "1.131", optional = true }
 axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
 clap = { version = "4.6", features = ["derive"] }

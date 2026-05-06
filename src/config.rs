@@ -20,6 +20,8 @@ pub struct Config {
     pub max_upload_bytes: usize,
     #[serde(default)]
     pub persistence: PersistenceConfig,
+    #[serde(default)]
+    pub object_store: ObjectStoreConfig,
     #[serde(rename = "identity-provider", default)]
     pub identity_providers: Vec<IdentityProviderConfig>,
     #[serde(rename = "publisher", default)]
@@ -63,6 +65,21 @@ pub struct IdmouseConfig {
     pub token_path: Box<Path>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ObjectStoreBackend {
+    Filesystem,
+    S3,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectStoreConfig {
+    #[serde(default)]
+    pub backend: ObjectStoreBackend,
+    pub bucket: Option<String>,
+}
+
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -82,6 +99,7 @@ impl Config {
             anyhow::bail!("max_upload_bytes must be greater than 0");
         }
         self.persistence.validate()?;
+        self.object_store.validate()?;
         if !disable_auth {
             if self.identity_providers.is_empty() {
                 anyhow::bail!("at least one [[identity-provider]] entry is required");
@@ -153,6 +171,40 @@ impl Default for PersistenceConfig {
             username: None,
             password_file: None,
             idmouse: None,
+        }
+    }
+}
+
+impl Default for ObjectStoreBackend {
+    fn default() -> Self {
+        Self::Filesystem
+    }
+}
+
+impl Default for ObjectStoreConfig {
+    fn default() -> Self {
+        Self {
+            backend: ObjectStoreBackend::Filesystem,
+            bucket: None,
+        }
+    }
+}
+
+impl ObjectStoreConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if let Some(bucket) = &self.bucket
+            && bucket.is_empty()
+        {
+            anyhow::bail!("object_store.bucket must not be empty");
+        }
+        match self.backend {
+            ObjectStoreBackend::Filesystem => Ok(()),
+            ObjectStoreBackend::S3 => {
+                if self.bucket.is_none() {
+                    anyhow::bail!("object_store.bucket is required when backend is s3");
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -267,7 +319,7 @@ fn read_secret_file(path: &Path) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, ObjectStoreBackend};
     use std::io::Write;
 
     #[test]
@@ -298,6 +350,84 @@ sub = "buildkite:deploy"
         assert_eq!(config.max_upload_bytes, 100 * 1024 * 1024);
         assert_eq!(config.persistence.uri, "mem://");
         assert_eq!(config.identity_providers[0].name, "buildkite");
+        assert_eq!(config.object_store.backend, ObjectStoreBackend::Filesystem);
+    }
+
+    #[test]
+    fn parses_s3_object_store_config() {
+        let config: Config = toml::from_str(
+            r#"
+[object_store]
+backend = "s3"
+bucket = "reposnake-packages"
+
+[[publisher]]
+projects = ["*"]
+"#,
+        )
+        .unwrap();
+
+        config.validate(true).unwrap();
+        assert_eq!(config.object_store.backend, ObjectStoreBackend::S3);
+        assert_eq!(
+            config.object_store.bucket.as_deref(),
+            Some("reposnake-packages")
+        );
+    }
+
+    #[test]
+    fn rejects_removed_s3_object_store_config_fields() {
+        for removed_field in [
+            "access_key_id = \"reposnake\"",
+            "secret_access_key_file = \"/run/secrets/aws-secret-access-key\"",
+            "session_token_file = \"/run/secrets/aws-session-token\"",
+            "prefix = \"simple/\"",
+            "region = \"eu-west-2\"",
+            "force_path_style = true",
+            "endpoint_url = \"http://localhost:9000\"",
+            "temp_directory = \"/tmp/reposnake-s3\"",
+        ] {
+            let config = format!(
+                r#"
+[object_store]
+backend = "s3"
+
+bucket = "reposnake-packages"
+{removed_field}
+"#
+            );
+
+            assert!(toml::from_str::<Config>(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_s3_object_store_without_bucket() {
+        let config: Config = toml::from_str(
+            r#"
+[object_store]
+backend = "s3"
+
+[[publisher]]
+projects = ["*"]
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate(true).is_err());
+    }
+
+    #[test]
+    fn rejects_nested_s3_object_store_config() {
+        let config = r#"
+[object_store]
+backend = "s3"
+
+[object_store.s3]
+bucket = "reposnake-packages"
+"#;
+
+        assert!(toml::from_str::<Config>(config).is_err());
     }
 
     #[test]

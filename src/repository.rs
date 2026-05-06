@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: The reposnake contributors
 
-use crate::config::PersistenceConfig;
+use crate::config::{ObjectStoreConfig, PersistenceConfig};
 use crate::error::AppError;
 use crate::metadata::{SharedMetadataStore, SurrealMetadataStore};
-use crate::object_store::{FilesystemObjectStore, SharedObjectStore};
+use crate::object_store::{SharedObjectStore, build_object_store};
 use crate::package::{
     FileRecord, ProjectIndex, ProjectSummary, UploadPackage, is_safe_filename,
     is_valid_project_name, normalize_name,
@@ -33,17 +33,18 @@ impl PackageRepository {
     pub async fn new(root: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let root = root.into();
         let metadata = Arc::new(SurrealMetadataStore::in_memory().await?);
-        let objects = Arc::new(FilesystemObjectStore::new(root.join("objects")));
+        let objects = build_object_store(&ObjectStoreConfig::default(), root).await?;
         Ok(Self::from_stores(metadata, objects))
     }
 
     pub async fn from_config(
         root: impl Into<PathBuf>,
         persistence: &PersistenceConfig,
+        object_store: &ObjectStoreConfig,
     ) -> anyhow::Result<Self> {
         let root = root.into();
         let metadata = Arc::new(SurrealMetadataStore::from_config(persistence).await?);
-        let objects = Arc::new(FilesystemObjectStore::new(root.join("objects")));
+        let objects = build_object_store(object_store, root).await?;
         Ok(Self::from_stores(metadata, objects))
     }
 

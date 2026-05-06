@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: The reposnake contributors
 
+use crate::config::{ObjectStoreBackend, ObjectStoreConfig};
 use crate::error::AppError;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -12,6 +13,36 @@ use tokio::io::AsyncWriteExt;
 
 pub type SharedObjectStore = Arc<dyn ObjectStore>;
 static TEMP_OBJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub async fn build_object_store(
+    config: &ObjectStoreConfig,
+    storage_root: impl Into<PathBuf>,
+) -> anyhow::Result<SharedObjectStore> {
+    match config.backend {
+        ObjectStoreBackend::Filesystem => Ok(Arc::new(FilesystemObjectStore::new(
+            storage_root.into().join("objects"),
+        ))),
+        ObjectStoreBackend::S3 => build_s3_object_store(config).await,
+    }
+}
+
+async fn build_s3_object_store(config: &ObjectStoreConfig) -> anyhow::Result<SharedObjectStore> {
+    #[cfg(feature = "s3")]
+    {
+        let bucket = config
+            .bucket
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("object_store.bucket is required when backend is s3"))?;
+        Ok(Arc::new(
+            crate::s3_object_store::S3ObjectStore::from_bucket(bucket).await?,
+        ))
+    }
+    #[cfg(not(feature = "s3"))]
+    {
+        let _ = config;
+        anyhow::bail!("object_store.backend = \"s3\" requires the s3 Cargo feature");
+    }
+}
 
 #[async_trait]
 pub trait ObjectStore: fmt::Debug + Send + Sync {

@@ -41,6 +41,7 @@ pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Res
         repository: PackageRepository::from_config(
             config.storage_directory.clone(),
             &config.persistence,
+            &config.object_store,
         )
         .await?,
         oci_registry: OciRegistry::new(config.storage_directory.clone()),

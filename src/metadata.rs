@@ -3,6 +3,7 @@
 
 use crate::config::PersistenceConfig;
 use crate::error::AppError;
+use crate::idmouse::IdmouseClient;
 use crate::package::{FileRecord, ProjectIndex, ProjectSummary};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -69,7 +70,11 @@ impl SurrealMetadataStore {
 
 pub async fn make_db(config: &PersistenceConfig) -> anyhow::Result<Arc<Surreal<Any>>> {
     let db = Arc::new(any::connect(&config.uri).await?);
-    if let (Some(username), Some(password)) = (&config.username, config.password()?) {
+    if let Some(idmouse) = config.idmouse.clone() {
+        IdmouseClient::new(idmouse)
+            .authenticate_db(db.clone())
+            .await?;
+    } else if let (Some(username), Some(password)) = (&config.username, config.password()?) {
         db.signin(surrealdb::opt::auth::Database {
             namespace: NAMESPACE,
             database: DATABASE,

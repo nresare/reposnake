@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod idmouse;
 pub mod kubernetes;
 pub mod metadata;
 pub mod object_store;

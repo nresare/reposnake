@@ -49,6 +49,13 @@ pub struct PersistenceConfig {
     pub uri: String,
     pub username: Option<String>,
     password_file: Option<Box<Path>>,
+    pub idmouse: Option<IdmouseConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdmouseConfig {
+    pub url: String,
+    pub token_path: Box<Path>,
 }
 
 impl Config {
@@ -111,6 +118,7 @@ impl Default for PersistenceConfig {
             uri: default_persistence_uri(),
             username: None,
             password_file: None,
+            idmouse: None,
         }
     }
 }
@@ -119,6 +127,15 @@ impl PersistenceConfig {
     fn validate(&self) -> anyhow::Result<()> {
         if self.uri.is_empty() {
             anyhow::bail!("persistence.uri must not be empty");
+        }
+        if let Some(idmouse) = &self.idmouse {
+            idmouse.validate()?;
+            if self.username.is_some() || self.password_file.is_some() {
+                anyhow::bail!(
+                    "persistence.username and persistence.password_file must not be set when persistence.idmouse is configured"
+                );
+            }
+            return Ok(());
         }
         match (&self.username, &self.password_file) {
             (Some(username), Some(_)) if !username.is_empty() => {}
@@ -135,6 +152,22 @@ impl PersistenceConfig {
             return Ok(None);
         };
         Ok(Some(read_secret_file(password_file)?))
+    }
+}
+
+impl IdmouseConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.url.is_empty() {
+            anyhow::bail!("persistence.idmouse.url must not be empty");
+        }
+        if self.token_path.as_os_str().is_empty() {
+            anyhow::bail!("persistence.idmouse.token_path must not be empty");
+        }
+        Ok(())
+    }
+
+    pub fn bearer_token(&self) -> anyhow::Result<String> {
+        read_secret_file(&self.token_path)
     }
 }
 
@@ -239,6 +272,58 @@ projects = ["*"]
         config.validate(true).unwrap();
         assert_eq!(config.persistence.uri, "ws://localhost:8000/");
         assert_eq!(config.persistence.username.as_deref(), Some("reposnake"));
+    }
+
+    #[test]
+    fn parses_idmouse_persistence_config() {
+        let config: Config = toml::from_str(
+            r#"
+[persistence]
+uri = "ws://localhost:8000/"
+
+[persistence.idmouse]
+url = "http://localhost:9000/token"
+token_path = "/run/secrets/idmouse-bearer-token"
+
+[[publisher]]
+projects = ["*"]
+"#,
+        )
+        .unwrap();
+
+        config.validate(true).unwrap();
+        let idmouse = config.persistence.idmouse.as_ref().unwrap();
+        assert_eq!(idmouse.url, "http://localhost:9000/token");
+        assert_eq!(
+            idmouse.token_path.to_string_lossy(),
+            "/run/secrets/idmouse-bearer-token"
+        );
+    }
+
+    #[test]
+    fn rejects_password_auth_when_idmouse_is_configured() {
+        let config: Config = toml::from_str(
+            r#"
+[persistence]
+uri = "ws://localhost:8000/"
+username = "reposnake"
+password_file = "/run/secrets/surrealdb-password"
+
+[persistence.idmouse]
+url = "http://localhost:9000/token"
+token_path = "/run/secrets/idmouse-bearer-token"
+
+[[publisher]]
+projects = ["*"]
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate(true).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "persistence.username and persistence.password_file must not be set when persistence.idmouse is configured"
+        );
     }
 
     #[test]

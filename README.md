@@ -18,6 +18,11 @@ uri = "mem://"
 # uri = "ws://localhost:8000/"
 # username = "reposnake"
 # password_file = "/run/secrets/surrealdb-password"
+#
+# Or authenticate to SurrealDB through idmouse:
+# [persistence.idmouse]
+# url = "http://idmouse.example/token"
+# token_path = "/run/secrets/idmouse-bearer-token"
 
 [authentication]
 audience = "reposnake"

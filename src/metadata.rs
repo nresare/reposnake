@@ -14,8 +14,8 @@ use surrealdb::engine::any;
 use surrealdb::engine::any::Any;
 use surrealdb::types::SurrealValue;
 
-const NAMESPACE: &str = "reposnake";
-const DATABASE: &str = "metadata";
+const NAMESPACE: &str = "default";
+const DATABASE: &str = "reposnake";
 
 pub type SharedMetadataStore = Arc<dyn MetadataStore>;
 

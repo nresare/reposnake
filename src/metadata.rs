@@ -12,6 +12,7 @@ use std::sync::Arc;
 use surrealdb::Surreal;
 use surrealdb::engine::any;
 use surrealdb::engine::any::Any;
+use surrealdb::types::SurrealValue;
 
 const NAMESPACE: &str = "reposnake";
 const DATABASE: &str = "metadata";
@@ -30,13 +31,15 @@ pub struct SurrealMetadataStore {
     db: Arc<Surreal<Any>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[surreal(crate = "surrealdb::types")]
 struct ProjectDoc {
     name: String,
     normalized_name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[surreal(crate = "surrealdb::types")]
 struct FileDoc {
     normalized_project: String,
     filename: String,
@@ -76,10 +79,10 @@ pub async fn make_db(config: &PersistenceConfig) -> anyhow::Result<Arc<Surreal<A
             .await?;
     } else if let (Some(username), Some(password)) = (&config.username, config.password()?) {
         db.signin(surrealdb::opt::auth::Database {
-            namespace: NAMESPACE,
-            database: DATABASE,
-            username,
-            password: &password,
+            namespace: NAMESPACE.to_string(),
+            database: DATABASE.to_string(),
+            username: username.to_string(),
+            password,
         })
         .await?;
     }

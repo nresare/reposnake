@@ -1383,6 +1383,7 @@ mod tests {
     }
 
     fn test_token(subject: &str, pipeline: &str) -> String {
+        crate::auth::install_jwt_crypto_provider();
         encode(
             &Header::new(Algorithm::HS256),
             &TestClaims {

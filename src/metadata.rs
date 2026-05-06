@@ -107,7 +107,9 @@ async fn mem_db() -> anyhow::Result<Arc<Surreal<Any>>> {
 async fn setup_db(db: &Surreal<Any>) -> anyhow::Result<()> {
     db.use_ns(NAMESPACE).use_db(DATABASE).await?;
     db.query(
-        "DEFINE INDEX IF NOT EXISTS packageFileByProjectFilename \
+        "DEFINE TABLE IF NOT EXISTS project; \
+         DEFINE TABLE IF NOT EXISTS package_file; \
+         DEFINE INDEX IF NOT EXISTS packageFileByProjectFilename \
          ON package_file FIELDS normalized_project, filename UNIQUE;",
     )
     .await?;

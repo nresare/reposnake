@@ -18,6 +18,7 @@ pub fn decoding_key_for_token(
     authentication: &AuthenticationConfig,
     bearer_token: &str,
 ) -> anyhow::Result<(Algorithm, DecodingKey)> {
+    install_jwt_crypto_provider();
     let algorithm = decode_header(bearer_token)
         .context("failed to decode upload token header")?
         .alg;
@@ -32,6 +33,10 @@ pub fn decoding_key_for_token(
         }
     };
     Ok((algorithm, decoding_key))
+}
+
+pub fn install_jwt_crypto_provider() {
+    let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
 }
 
 fn decoding_key_for_algorithm(

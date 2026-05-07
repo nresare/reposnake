@@ -7,10 +7,10 @@ It serves the Python Simple Repository API from the service root, stores uploade
 ## Configuration
 
 ```toml
-bind_address = "0.0.0.0:8080"
-max_upload_bytes = 104857600
+bind-address = "0.0.0.0:8080"
+max-upload-bytes = 104857600
 
-[object_store]
+[object-store]
 directory = "/data"
 
 [persistence]
@@ -26,12 +26,12 @@ uri = "mem://"
 # For a SurrealDB server:
 # uri = "ws://localhost:8000/"
 # username = "reposnake"
-# password_file = "/run/secrets/surrealdb-password"
+# password-file = "/run/secrets/surrealdb-password"
 #
 # Or authenticate to SurrealDB through idmouse:
 # [persistence.idmouse]
 # url = "http://idmouse.example/token"
-# token_path = "/run/secrets/idmouse-bearer-token"
+# token-path = "/run/secrets/idmouse-bearer-token"
 
 [[identity-provider]]
 name = "kubernetes"
@@ -40,7 +40,7 @@ issuer = "https://issuer.example"
 
 # Optional. If omitted, reposnake fetches
 # <issuer>/.well-known/openid-configuration and uses the returned jwks_uri.
-validation_key = """
+validation-key = """
 -----BEGIN PUBLIC KEY-----
 ...
 -----END PUBLIC KEY-----
@@ -51,7 +51,7 @@ name = "ci"
 projects = ["example-package", "other_package"]
 identity-provider = "kubernetes"
 
-[publisher.required_claims]
+[publisher.required-claims]
 sub = "system:serviceaccount:build:publisher"
 repository = "example-package"
 ```

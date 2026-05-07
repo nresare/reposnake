@@ -4,10 +4,10 @@ metadata:
   name: reposnake
 data:
   config: |
-    bind_address = "0.0.0.0:8080"
-    max_upload_bytes = 104857600
+    bind-address = "0.0.0.0:8080"
+    max-upload-bytes = 104857600
 
-    [object_store]
+    [object-store]
     directory = "/data"
 
     [persistence]
@@ -20,7 +20,7 @@ data:
 
     # Optional. If omitted, reposnake fetches
     # <issuer>/.well-known/openid-configuration and uses the returned jwks_uri.
-    validation_key = """
+    validation-key = """
     -----BEGIN PUBLIC KEY-----
     ...
     -----END PUBLIC KEY-----
@@ -30,6 +30,6 @@ data:
     name = "ci"
     projects = ["example-package"]
 
-    [publisher.required_claims]
+    [publisher.required-claims]
     sub = "system:serviceaccount:build:publisher"
     repository = "example-package"

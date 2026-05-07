@@ -26,7 +26,7 @@ pub async fn build_object_store(config: &ObjectStoreConfig) -> anyhow::Result<Sh
     match config.backend {
         ObjectStoreBackend::Filesystem => {
             let directory = config.directory.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("object_store.directory is required when backend is filesystem")
+                anyhow::anyhow!("object-store.directory is required when backend is filesystem")
             })?;
             Ok(Arc::new(FilesystemObjectStore::new(
                 directory.join("objects"),
@@ -141,7 +141,7 @@ async fn build_s3_object_store(config: &ObjectStoreConfig) -> anyhow::Result<Sha
         let bucket = config
             .bucket
             .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("object_store.bucket is required when backend is s3"))?;
+            .ok_or_else(|| anyhow::anyhow!("object-store.bucket is required when backend is s3"))?;
         Ok(Arc::new(
             crate::s3_object_store::S3ObjectStore::from_bucket(bucket).await?,
         ))
@@ -149,7 +149,7 @@ async fn build_s3_object_store(config: &ObjectStoreConfig) -> anyhow::Result<Sha
     #[cfg(not(feature = "s3"))]
     {
         let _ = config;
-        anyhow::bail!("object_store.backend = \"s3\" requires the s3 Cargo feature");
+        anyhow::bail!("object-store.backend = \"s3\" requires the s3 Cargo feature");
     }
 }
 

@@ -27,7 +27,7 @@ pub fn decoding_key_for_token(
         None => {
             info!(
                 issuer = %authentication.issuer,
-                "identity-provider.validation_key not configured; attempting issuer-based validation key discovery"
+                "identity-provider.validation-key not configured; attempting issuer-based validation key discovery"
             );
             discovery_decoding_key(authentication, bearer_token, algorithm)?
         }

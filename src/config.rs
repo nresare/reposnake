@@ -11,7 +11,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
@@ -28,6 +28,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct IdentityProviderConfig {
     #[serde(default)]
     pub name: String,
@@ -39,6 +40,7 @@ pub struct IdentityProviderConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct PublisherConfig {
     #[serde(default)]
     pub name: String,
@@ -46,10 +48,12 @@ pub struct PublisherConfig {
     #[serde(rename = "identity-provider")]
     pub identity_provider: Option<String>,
     #[serde(default)]
+    #[serde(rename = "required-claims")]
     pub required_claims: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct PersistenceConfig {
     #[serde(default = "default_persistence_uri")]
     pub uri: String,
@@ -59,6 +63,7 @@ pub struct PersistenceConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct IdmouseConfig {
     pub url: String,
     pub token_path: Box<Path>,
@@ -92,10 +97,10 @@ impl Config {
 
     pub fn validate(&self, disable_auth: bool) -> anyhow::Result<()> {
         if self.bind_address.is_empty() {
-            anyhow::bail!("bind_address must not be empty");
+            anyhow::bail!("bind-address must not be empty");
         }
         if self.max_upload_bytes == 0 {
-            anyhow::bail!("max_upload_bytes must be greater than 0");
+            anyhow::bail!("max-upload-bytes must be greater than 0");
         }
         self.persistence.validate()?;
         self.object_store.validate()?;
@@ -195,23 +200,23 @@ impl ObjectStoreConfig {
         if let Some(directory) = &self.directory
             && directory.as_os_str().is_empty()
         {
-            anyhow::bail!("object_store.directory must not be empty");
+            anyhow::bail!("object-store.directory must not be empty");
         }
         if let Some(bucket) = &self.bucket
             && bucket.is_empty()
         {
-            anyhow::bail!("object_store.bucket must not be empty");
+            anyhow::bail!("object-store.bucket must not be empty");
         }
         match self.backend {
             ObjectStoreBackend::Filesystem => {
                 if self.directory.is_none() {
-                    anyhow::bail!("object_store.directory is required when backend is filesystem");
+                    anyhow::bail!("object-store.directory is required when backend is filesystem");
                 }
                 Ok(())
             }
             ObjectStoreBackend::S3 => {
                 if self.bucket.is_none() {
-                    anyhow::bail!("object_store.bucket is required when backend is s3");
+                    anyhow::bail!("object-store.bucket is required when backend is s3");
                 }
                 Ok(())
             }
@@ -228,7 +233,7 @@ impl PersistenceConfig {
             idmouse.validate()?;
             if self.username.is_some() || self.password_file.is_some() {
                 anyhow::bail!(
-                    "persistence.username and persistence.password_file must not be set when persistence.idmouse is configured"
+                    "persistence.username and persistence.password-file must not be set when persistence.idmouse is configured"
                 );
             }
             return Ok(());
@@ -237,7 +242,7 @@ impl PersistenceConfig {
             (Some(username), Some(_)) if !username.is_empty() => {}
             (None, None) => {}
             _ => anyhow::bail!(
-                "persistence.username and persistence.password_file must be set together"
+                "persistence.username and persistence.password-file must be set together"
             ),
         }
         Ok(())
@@ -257,7 +262,7 @@ impl IdmouseConfig {
             anyhow::bail!("persistence.idmouse.url must not be empty");
         }
         if self.token_path.as_os_str().is_empty() {
-            anyhow::bail!("persistence.idmouse.token_path must not be empty");
+            anyhow::bail!("persistence.idmouse.token-path must not be empty");
         }
         Ok(())
     }
@@ -285,7 +290,7 @@ impl IdentityProviderConfig {
             Some(validation_key) if !validation_key.is_empty() => {}
             None => {}
             _ => anyhow::bail!(
-                "identity-provider '{}' validation_key must not be empty",
+                "identity-provider '{}' validation-key must not be empty",
                 self.name
             ),
         }
@@ -341,14 +346,14 @@ mod tests {
 name = "buildkite"
 audience = "reposnake"
 issuer = "https://issuer.example"
-validation_key = "shared-secret"
+validation-key = "shared-secret"
 
 [[publisher]]
 name = "ci"
 projects = ["reposnake-demo", "other_demo"]
 identity-provider = "buildkite"
 
-[publisher.required_claims]
+[publisher.required-claims]
 sub = "buildkite:deploy"
 "#,
         )
@@ -370,7 +375,7 @@ sub = "buildkite:deploy"
     fn parses_filesystem_object_store_directory() {
         let config: Config = toml::from_str(
             r#"
-[object_store]
+[object-store]
 directory = "/tmp/reposnake"
 
 [[publisher]]
@@ -391,7 +396,7 @@ projects = ["*"]
     fn parses_s3_object_store_config() {
         let config: Config = toml::from_str(
             r#"
-[object_store]
+[object-store]
 backend = "s3"
 bucket = "reposnake-packages"
 directory = "/data"
@@ -413,19 +418,19 @@ projects = ["*"]
     #[test]
     fn rejects_removed_s3_object_store_config_fields() {
         for removed_field in [
-            "access_key_id = \"reposnake\"",
-            "secret_access_key_file = \"/run/secrets/aws-secret-access-key\"",
-            "session_token_file = \"/run/secrets/aws-session-token\"",
+            "access-key-id = \"reposnake\"",
+            "secret-access-key-file = \"/run/secrets/aws-secret-access-key\"",
+            "session-token-file = \"/run/secrets/aws-session-token\"",
             "prefix = \"simple/\"",
             "region = \"eu-west-2\"",
-            "force_path_style = true",
-            "endpoint_url = \"http://localhost:9000\"",
-            "temp_directory = \"/tmp/reposnake-s3\"",
-            "storage_directory = \"/data\"",
+            "force-path-style = true",
+            "endpoint-url = \"http://localhost:9000\"",
+            "temp-directory = \"/tmp/reposnake-s3\"",
+            "storage-directory = \"/data\"",
         ] {
             let config = format!(
                 r#"
-[object_store]
+[object-store]
 backend = "s3"
 
 bucket = "reposnake-packages"
@@ -440,7 +445,7 @@ bucket = "reposnake-packages"
     #[test]
     fn rejects_removed_top_level_storage_directory() {
         let config = r#"
-storage_directory = "/data"
+storage-directory = "/data"
 
 [[publisher]]
 projects = ["*"]
@@ -450,10 +455,51 @@ projects = ["*"]
     }
 
     #[test]
+    fn rejects_snake_case_config_fields() {
+        for config in [
+            r#"
+bind_address = "0.0.0.0:8080"
+"#,
+            r#"
+max_upload_bytes = 104857600
+"#,
+            r#"
+[object_store]
+directory = "/data"
+"#,
+            r#"
+[persistence]
+password_file = "/run/secrets/surrealdb-password"
+"#,
+            r#"
+[persistence.idmouse]
+url = "http://localhost:9000/token"
+token_path = "/run/secrets/idmouse-bearer-token"
+"#,
+            r#"
+[[identity-provider]]
+name = "buildkite"
+audience = "reposnake"
+issuer = "https://issuer.example"
+validation_key = "shared-secret"
+"#,
+            r#"
+[[publisher]]
+projects = ["*"]
+
+[publisher.required_claims]
+repository_owner = "example"
+"#,
+        ] {
+            assert!(toml::from_str::<Config>(config).is_err());
+        }
+    }
+
+    #[test]
     fn rejects_s3_object_store_without_bucket() {
         let config: Config = toml::from_str(
             r#"
-[object_store]
+[object-store]
 backend = "s3"
 
 [[publisher]]
@@ -469,7 +515,7 @@ projects = ["*"]
     fn accepts_s3_object_store_without_directory() {
         let config: Config = toml::from_str(
             r#"
-[object_store]
+[object-store]
 backend = "s3"
 bucket = "reposnake-packages"
 
@@ -487,7 +533,7 @@ projects = ["*"]
     fn rejects_filesystem_object_store_without_directory() {
         let config: Config = toml::from_str(
             r#"
-[object_store]
+[object-store]
 backend = "filesystem"
 
 [[publisher]]
@@ -502,10 +548,10 @@ projects = ["*"]
     #[test]
     fn rejects_nested_s3_object_store_config() {
         let config = r#"
-[object_store]
+[object-store]
 backend = "s3"
 
-[object_store.s3]
+[object-store.s3]
 bucket = "reposnake-packages"
 "#;
 
@@ -519,7 +565,7 @@ bucket = "reposnake-packages"
 [persistence]
 uri = "ws://localhost:8000/"
 username = "reposnake"
-password_file = "/run/secrets/surrealdb-password"
+password-file = "/run/secrets/surrealdb-password"
 
 [[publisher]]
 projects = ["*"]
@@ -541,7 +587,7 @@ uri = "ws://localhost:8000/"
 
 [persistence.idmouse]
 url = "http://localhost:9000/token"
-token_path = "/run/secrets/idmouse-bearer-token"
+token-path = "/run/secrets/idmouse-bearer-token"
 
 [[publisher]]
 projects = ["*"]
@@ -565,11 +611,11 @@ projects = ["*"]
 [persistence]
 uri = "ws://localhost:8000/"
 username = "reposnake"
-password_file = "/run/secrets/surrealdb-password"
+password-file = "/run/secrets/surrealdb-password"
 
 [persistence.idmouse]
 url = "http://localhost:9000/token"
-token_path = "/run/secrets/idmouse-bearer-token"
+token-path = "/run/secrets/idmouse-bearer-token"
 
 [[publisher]]
 projects = ["*"]
@@ -580,7 +626,7 @@ projects = ["*"]
         let error = config.validate(true).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "persistence.username and persistence.password_file must not be set when persistence.idmouse is configured"
+            "persistence.username and persistence.password-file must not be set when persistence.idmouse is configured"
         );
     }
 
@@ -593,7 +639,7 @@ projects = ["*"]
 [persistence]
 uri = "ws://localhost:8000/"
 username = "reposnake"
-password_file = "{}"
+password-file = "{}"
 
 [[publisher]]
 projects = ["*"]
@@ -628,7 +674,7 @@ projects = ["*"]
 [[publisher]]
 projects = ["*"]
 
-[publisher.required_claims]
+[publisher.required-claims]
 sub = "buildkite:deploy"
 "#,
         )
@@ -673,13 +719,35 @@ issuer = "https://issuer.example"
 projects = ["*"]
 identity-provider = "buildkite"
 
-[publisher.required_claims]
+[publisher.required-claims]
 sub = "buildkite:deploy"
 "#,
         )
         .unwrap();
 
         config.validate(false).unwrap();
+    }
+
+    #[test]
+    fn required_claim_keys_are_not_renamed() {
+        let config: Config = toml::from_str(
+            r#"
+[[publisher]]
+projects = ["*"]
+
+[publisher.required-claims]
+repository_owner = "example"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.publishers[0]
+                .required_claims
+                .get("repository_owner")
+                .map(String::as_str),
+            Some("example")
+        );
     }
 
     #[test]
@@ -695,7 +763,7 @@ issuer = "https://kubernetes.default.svc"
 projects = ["*"]
 identity-provider = "buildkite"
 
-[publisher.required_claims]
+[publisher.required-claims]
 sub = "buildkite:deploy"
 "#,
         )

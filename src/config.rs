@@ -67,7 +67,9 @@ pub struct IdmouseConfig {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum ObjectStoreBackend {
+    #[default]
     Filesystem,
     S3,
 }
@@ -172,12 +174,6 @@ impl Default for PersistenceConfig {
             password_file: None,
             idmouse: None,
         }
-    }
-}
-
-impl Default for ObjectStoreBackend {
-    fn default() -> Self {
-        Self::Filesystem
     }
 }
 

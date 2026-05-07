@@ -3,6 +3,7 @@
 
 use crate::config::{ObjectStoreBackend, ObjectStoreConfig};
 use crate::error::AppError;
+use anyhow::Context;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -10,20 +11,128 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncWriteExt;
+use tracing::{info, warn};
 
 pub type SharedObjectStore = Arc<dyn ObjectStore>;
 static TEMP_OBJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-pub async fn build_object_store(
-    config: &ObjectStoreConfig,
-    storage_root: impl Into<PathBuf>,
-) -> anyhow::Result<SharedObjectStore> {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectMigrationStats {
+    pub copied: usize,
+    pub skipped: usize,
+}
+
+pub async fn build_object_store(config: &ObjectStoreConfig) -> anyhow::Result<SharedObjectStore> {
     match config.backend {
-        ObjectStoreBackend::Filesystem => Ok(Arc::new(FilesystemObjectStore::new(
-            storage_root.into().join("objects"),
-        ))),
+        ObjectStoreBackend::Filesystem => {
+            let directory = config.directory.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("object_store.directory is required when backend is filesystem")
+            })?;
+            Ok(Arc::new(FilesystemObjectStore::new(
+                directory.join("objects"),
+            )))
+        }
         ObjectStoreBackend::S3 => build_s3_object_store(config).await,
     }
+}
+
+pub async fn migrate_filesystem_objects_to_store(
+    storage_root: impl Into<PathBuf>,
+    destination: &dyn ObjectStore,
+) -> anyhow::Result<ObjectMigrationStats> {
+    let object_root = storage_root.into().join("objects");
+    let mut entries = match tokio::fs::read_dir(&object_root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            info!(
+                object_directory = %object_root.display(),
+                "no filesystem objects to migrate"
+            );
+            return Ok(ObjectMigrationStats::default());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read filesystem object directory '{}'",
+                    object_root.display()
+                )
+            });
+        }
+    };
+
+    let mut stats = ObjectMigrationStats::default();
+    while let Some(entry) = entries.next_entry().await.with_context(|| {
+        format!(
+            "failed to read filesystem object directory '{}'",
+            object_root.display()
+        )
+    })? {
+        if !entry
+            .file_type()
+            .await
+            .with_context(|| format!("failed to inspect '{}'", entry.path().display()))?
+            .is_file()
+        {
+            stats.skipped += 1;
+            continue;
+        }
+
+        let Some(expected_sha256) = object_digest_from_filename(&entry.file_name()) else {
+            stats.skipped += 1;
+            warn!(
+                path = %entry.path().display(),
+                "skipping filesystem object with invalid digest filename"
+            );
+            continue;
+        };
+
+        let content = tokio::fs::read(entry.path()).await.with_context(|| {
+            format!(
+                "failed to read filesystem object '{}'",
+                entry.path().display()
+            )
+        })?;
+        let actual_sha256: [u8; 32] = Sha256::digest(&content).into();
+        if actual_sha256 != expected_sha256 {
+            stats.skipped += 1;
+            warn!(
+                path = %entry.path().display(),
+                expected = %hex::encode(expected_sha256),
+                actual = %hex::encode(actual_sha256),
+                "skipping filesystem object whose content digest does not match its filename"
+            );
+            continue;
+        }
+
+        let mut writer = destination
+            .create_writer()
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to create migrated object writer: {error}"))?;
+        writer
+            .write_chunk(&content)
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to write migrated object: {error}"))?;
+        let stored_sha256 = writer
+            .commit()
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to commit migrated object: {error}"))?;
+        if stored_sha256 != expected_sha256 {
+            anyhow::bail!(
+                "migrated object '{}' was stored as unexpected digest '{}'",
+                hex::encode(expected_sha256),
+                hex::encode(stored_sha256)
+            );
+        }
+        stats.copied += 1;
+    }
+
+    info!(
+        object_directory = %object_root.display(),
+        copied = stats.copied,
+        skipped = stats.skipped,
+        "migrated filesystem objects to configured object store"
+    );
+    Ok(stats)
 }
 
 async fn build_s3_object_store(config: &ObjectStoreConfig) -> anyhow::Result<SharedObjectStore> {
@@ -42,6 +151,15 @@ async fn build_s3_object_store(config: &ObjectStoreConfig) -> anyhow::Result<Sha
         let _ = config;
         anyhow::bail!("object_store.backend = \"s3\" requires the s3 Cargo feature");
     }
+}
+
+fn object_digest_from_filename(filename: &std::ffi::OsStr) -> Option<[u8; 32]> {
+    let filename = filename.to_str()?;
+    if filename.len() != 64 {
+        return None;
+    }
+    let bytes = hex::decode(filename).ok()?;
+    bytes.try_into().ok()
 }
 
 #[async_trait]
@@ -220,7 +338,7 @@ fn next_temp_object_id() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilesystemObjectStore, ObjectStore};
+    use super::{FilesystemObjectStore, ObjectStore, migrate_filesystem_objects_to_store};
     use sha2::{Digest as _, Sha256};
 
     #[tokio::test]
@@ -254,6 +372,55 @@ mod tests {
             }
         }
         assert_eq!(object_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migrates_filesystem_objects_to_destination_store() -> anyhow::Result<()> {
+        let source = tempfile::tempdir()?;
+        let destination = tempfile::tempdir()?;
+        let content = b"package-content";
+        let digest: [u8; 32] = Sha256::digest(content).into();
+        let digest_hex = hex::encode(digest);
+        let source_objects = source.path().join("objects");
+        tokio::fs::create_dir_all(&source_objects).await?;
+        tokio::fs::write(source_objects.join(&digest_hex), content).await?;
+
+        let destination_store = FilesystemObjectStore::new(destination.path().join("objects"));
+        let stats = migrate_filesystem_objects_to_store(source.path(), &destination_store).await?;
+
+        assert_eq!(stats.copied, 1);
+        assert_eq!(stats.skipped, 0);
+        assert_eq!(destination_store.read(&digest).await?, content);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_skips_invalid_and_mismatched_filesystem_objects() -> anyhow::Result<()> {
+        let source = tempfile::tempdir()?;
+        let destination = tempfile::tempdir()?;
+        let source_objects = source.path().join("objects");
+        tokio::fs::create_dir_all(&source_objects).await?;
+        tokio::fs::write(source_objects.join("not-a-digest"), b"ignored").await?;
+        tokio::fs::write(source_objects.join("0".repeat(64)), b"wrong-content").await?;
+
+        let destination_store = FilesystemObjectStore::new(destination.path().join("objects"));
+        let stats = migrate_filesystem_objects_to_store(source.path(), &destination_store).await?;
+
+        assert_eq!(stats.copied, 0);
+        assert_eq!(stats.skipped, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_is_noop_when_filesystem_objects_do_not_exist() -> anyhow::Result<()> {
+        let source = tempfile::tempdir()?;
+        let destination = tempfile::tempdir()?;
+        let destination_store = FilesystemObjectStore::new(destination.path().join("objects"));
+        let stats = migrate_filesystem_objects_to_store(source.path(), &destination_store).await?;
+
+        assert_eq!(stats.copied, 0);
+        assert_eq!(stats.skipped, 0);
         Ok(())
     }
 }

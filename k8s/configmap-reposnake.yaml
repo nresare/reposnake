@@ -5,13 +5,16 @@ metadata:
 data:
   config: |
     bind_address = "0.0.0.0:8080"
-    storage_directory = "/data"
     max_upload_bytes = 104857600
+
+    [object_store]
+    directory = "/data"
 
     [persistence]
     uri = "mem://"
 
-    [authentication]
+    [[identity-provider]]
+    name = "kubernetes"
     audience = "reposnake"
     issuer = "https://issuer.example"
 

@@ -8,18 +8,20 @@ It serves the Python Simple Repository API from the service root, stores uploade
 
 ```toml
 bind_address = "0.0.0.0:8080"
-storage_directory = "/data"
 max_upload_bytes = 104857600
+
+[object_store]
+directory = "/data"
 
 [persistence]
 uri = "mem://"
 
-# Optional. When enabled, S3 credentials come from the ambient AWS provider chain,
+# Optional. For S3, credentials come from the ambient AWS provider chain,
 # such as AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_WEB_IDENTITY_TOKEN_FILE,
 # ECS/EC2 metadata, or IRSA. Set AWS_REGION in the environment.
-# [object_store]
 # backend = "s3"
 # bucket = "reposnake-packages"
+# directory = "/data" # Optional migration source for existing filesystem objects.
 
 # For a SurrealDB server:
 # uri = "ws://localhost:8000/"

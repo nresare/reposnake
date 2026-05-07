@@ -11,11 +11,10 @@ use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
-    #[serde(default = "default_storage_directory")]
-    pub storage_directory: PathBuf,
     #[serde(default = "default_max_upload_bytes")]
     pub max_upload_bytes: usize,
     #[serde(default)]
@@ -79,6 +78,7 @@ pub enum ObjectStoreBackend {
 pub struct ObjectStoreConfig {
     #[serde(default)]
     pub backend: ObjectStoreBackend,
+    pub directory: Option<PathBuf>,
     pub bucket: Option<String>,
 }
 
@@ -93,9 +93,6 @@ impl Config {
     pub fn validate(&self, disable_auth: bool) -> anyhow::Result<()> {
         if self.bind_address.is_empty() {
             anyhow::bail!("bind_address must not be empty");
-        }
-        if self.storage_directory.as_os_str().is_empty() {
-            anyhow::bail!("storage_directory must not be empty");
         }
         if self.max_upload_bytes == 0 {
             anyhow::bail!("max_upload_bytes must be greater than 0");
@@ -181,20 +178,37 @@ impl Default for ObjectStoreConfig {
     fn default() -> Self {
         Self {
             backend: ObjectStoreBackend::Filesystem,
+            directory: Some(default_object_store_directory()),
             bucket: None,
         }
     }
 }
 
 impl ObjectStoreConfig {
+    pub fn directory_or_default(&self) -> PathBuf {
+        self.directory
+            .clone()
+            .unwrap_or_else(default_object_store_directory)
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
+        if let Some(directory) = &self.directory
+            && directory.as_os_str().is_empty()
+        {
+            anyhow::bail!("object_store.directory must not be empty");
+        }
         if let Some(bucket) = &self.bucket
             && bucket.is_empty()
         {
             anyhow::bail!("object_store.bucket must not be empty");
         }
         match self.backend {
-            ObjectStoreBackend::Filesystem => Ok(()),
+            ObjectStoreBackend::Filesystem => {
+                if self.directory.is_none() {
+                    anyhow::bail!("object_store.directory is required when backend is filesystem");
+                }
+                Ok(())
+            }
             ObjectStoreBackend::S3 => {
                 if self.bucket.is_none() {
                     anyhow::bail!("object_store.bucket is required when backend is s3");
@@ -293,7 +307,7 @@ fn default_bind_address() -> String {
     "0.0.0.0:8080".to_string()
 }
 
-fn default_storage_directory() -> PathBuf {
+fn default_object_store_directory() -> PathBuf {
     "/data".into()
 }
 
@@ -317,13 +331,12 @@ fn read_secret_file(path: &Path) -> anyhow::Result<String> {
 mod tests {
     use super::{Config, ObjectStoreBackend};
     use std::io::Write;
+    use std::path::Path;
 
     #[test]
     fn parses_minimal_authenticated_config() {
         let config: Config = toml::from_str(
             r#"
-storage_directory = "/tmp/reposnake"
-
 [[identity-provider]]
 name = "buildkite"
 audience = "reposnake"
@@ -347,6 +360,31 @@ sub = "buildkite:deploy"
         assert_eq!(config.persistence.uri, "mem://");
         assert_eq!(config.identity_providers[0].name, "buildkite");
         assert_eq!(config.object_store.backend, ObjectStoreBackend::Filesystem);
+        assert_eq!(
+            config.object_store.directory.as_deref(),
+            Some(Path::new("/data"))
+        );
+    }
+
+    #[test]
+    fn parses_filesystem_object_store_directory() {
+        let config: Config = toml::from_str(
+            r#"
+[object_store]
+directory = "/tmp/reposnake"
+
+[[publisher]]
+projects = ["*"]
+"#,
+        )
+        .unwrap();
+
+        config.validate(true).unwrap();
+        assert_eq!(config.object_store.backend, ObjectStoreBackend::Filesystem);
+        assert_eq!(
+            config.object_store.directory.as_deref(),
+            Some(Path::new("/tmp/reposnake"))
+        );
     }
 
     #[test]
@@ -356,6 +394,7 @@ sub = "buildkite:deploy"
 [object_store]
 backend = "s3"
 bucket = "reposnake-packages"
+directory = "/data"
 
 [[publisher]]
 projects = ["*"]
@@ -382,6 +421,7 @@ projects = ["*"]
             "force_path_style = true",
             "endpoint_url = \"http://localhost:9000\"",
             "temp_directory = \"/tmp/reposnake-s3\"",
+            "storage_directory = \"/data\"",
         ] {
             let config = format!(
                 r#"
@@ -398,11 +438,57 @@ bucket = "reposnake-packages"
     }
 
     #[test]
+    fn rejects_removed_top_level_storage_directory() {
+        let config = r#"
+storage_directory = "/data"
+
+[[publisher]]
+projects = ["*"]
+"#;
+
+        assert!(toml::from_str::<Config>(config).is_err());
+    }
+
+    #[test]
     fn rejects_s3_object_store_without_bucket() {
         let config: Config = toml::from_str(
             r#"
 [object_store]
 backend = "s3"
+
+[[publisher]]
+projects = ["*"]
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate(true).is_err());
+    }
+
+    #[test]
+    fn accepts_s3_object_store_without_directory() {
+        let config: Config = toml::from_str(
+            r#"
+[object_store]
+backend = "s3"
+bucket = "reposnake-packages"
+
+[[publisher]]
+projects = ["*"]
+"#,
+        )
+        .unwrap();
+
+        config.validate(true).unwrap();
+        assert_eq!(config.object_store.directory, None);
+    }
+
+    #[test]
+    fn rejects_filesystem_object_store_without_directory() {
+        let config: Config = toml::from_str(
+            r#"
+[object_store]
+backend = "filesystem"
 
 [[publisher]]
 projects = ["*"]

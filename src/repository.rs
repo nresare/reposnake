@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: The reposnake contributors
 
-use crate::config::{ObjectStoreConfig, PersistenceConfig};
+use crate::config::{ObjectStoreBackend, ObjectStoreConfig, PersistenceConfig};
 use crate::error::AppError;
 use crate::metadata::{SharedMetadataStore, SurrealMetadataStore};
-use crate::object_store::{SharedObjectStore, build_object_store};
+use crate::object_store::{
+    SharedObjectStore, build_object_store, migrate_filesystem_objects_to_store,
+};
 use crate::package::{
     FileRecord, ProjectIndex, ProjectSummary, UploadPackage, is_safe_filename,
     is_valid_project_name, normalize_name,
@@ -31,20 +33,28 @@ impl std::fmt::Debug for PackageRepository {
 
 impl PackageRepository {
     pub async fn new(root: impl Into<PathBuf>) -> anyhow::Result<Self> {
-        let root = root.into();
         let metadata = Arc::new(SurrealMetadataStore::in_memory().await?);
-        let objects = build_object_store(&ObjectStoreConfig::default(), root).await?;
+        let object_store = ObjectStoreConfig {
+            backend: ObjectStoreBackend::Filesystem,
+            directory: Some(root.into()),
+            bucket: None,
+        };
+        let objects = build_object_store(&object_store).await?;
         Ok(Self::from_stores(metadata, objects))
     }
 
     pub async fn from_config(
-        root: impl Into<PathBuf>,
         persistence: &PersistenceConfig,
         object_store: &ObjectStoreConfig,
     ) -> anyhow::Result<Self> {
-        let root = root.into();
         let metadata = Arc::new(SurrealMetadataStore::from_config(persistence).await?);
-        let objects = build_object_store(object_store, root).await?;
+        let objects = build_object_store(object_store).await?;
+        if object_store.backend == ObjectStoreBackend::S3
+            && object_store.bucket.is_some()
+            && let Some(directory) = &object_store.directory
+        {
+            migrate_filesystem_objects_to_store(directory, objects.as_ref()).await?;
+        }
         Ok(Self::from_stores(metadata, objects))
     }
 

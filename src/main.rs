@@ -53,12 +53,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let config = Config::load(&cli.config_path)?;
     config.validate(cli.disable_auth)?;
     let bind_address: SocketAddr = config.bind_address.parse()?;
-    let storage_directory = config.storage_directory.display().to_string();
+    let object_directory = config.object_store.directory_or_default();
 
     info!(
         version = VERSION,
         config_path = %cli.config_path,
-        storage_directory = %storage_directory,
+        object_directory = %object_directory.display(),
         disable_auth = cli.disable_auth,
         debug = cli.debug,
         "starting reposnake"

@@ -5,6 +5,7 @@ use crate::config::PersistenceConfig;
 use crate::error::AppError;
 use crate::idmouse::IdmouseClient;
 use crate::package::{FileRecord, ProjectIndex, ProjectSummary};
+use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -72,11 +73,16 @@ impl SurrealMetadataStore {
 }
 
 pub async fn make_db(config: &PersistenceConfig) -> anyhow::Result<Arc<Surreal<Any>>> {
-    let db = Arc::new(any::connect(&config.uri).await?);
+    let db = Arc::new(
+        any::connect(&config.uri)
+            .await
+            .with_context(|| format!("failed to connect to metadata store '{}'", config.uri))?,
+    );
     if let Some(idmouse) = config.idmouse.clone() {
         IdmouseClient::new(idmouse)
             .authenticate_db(db.clone())
-            .await?;
+            .await
+            .context("failed to authenticate metadata store through idmouse")?;
     } else if let (Some(username), Some(password)) = (&config.username, config.password()?) {
         db.signin(surrealdb::opt::auth::Database {
             namespace: NAMESPACE.to_string(),
@@ -86,7 +92,9 @@ pub async fn make_db(config: &PersistenceConfig) -> anyhow::Result<Arc<Surreal<A
         })
         .await?;
     }
-    setup_db(db.as_ref()).await?;
+    setup_db(db.as_ref())
+        .await
+        .context("failed to initialize metadata store schema")?;
     Ok(db)
 }
 

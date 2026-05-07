@@ -12,6 +12,7 @@ use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config as AwsS3Config};
 use sha2::{Digest, Sha256};
+use std::error::Error;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncWriteExt;
@@ -65,7 +66,10 @@ impl ObjectStore for S3ObjectStore {
                 if is_s3_get_not_found(&error) {
                     AppError::NotFound(format!("object '{}' not found", hex::encode(sha256)))
                 } else {
-                    AppError::Internal(format!("failed to read S3 object '{key}': {error}"))
+                    AppError::Internal(format!(
+                        "failed to read S3 object '{key}': {}",
+                        format_error_chain(&error)
+                    ))
                 }
             })?;
         let bytes = output.body.collect().await.map_err(|error| {
@@ -183,8 +187,9 @@ impl ObjectWriter for S3ObjectWriter {
             Err(error) if is_s3_head_not_found(&error) => false,
             Err(error) => {
                 let message = format!(
-                    "failed to check S3 object '{key}' in bucket '{}': {error}",
-                    self.bucket
+                    "failed to check S3 object '{key}' in bucket '{}': {}",
+                    self.bucket,
+                    format_error_chain(&error)
                 );
                 self.abort().await?;
                 return Err(AppError::Internal(message));
@@ -225,8 +230,9 @@ impl ObjectWriter for S3ObjectWriter {
             }
             Err(error) => {
                 let message = format!(
-                    "failed to write S3 object '{key}' to bucket '{}': {error}",
-                    self.bucket
+                    "failed to write S3 object '{key}' to bucket '{}': {}",
+                    self.bucket,
+                    format_error_chain(&error)
                 );
                 self.abort().await?;
                 Err(AppError::Internal(message))
@@ -279,10 +285,40 @@ fn is_s3_precondition_failed(error: &SdkError<PutObjectError>) -> bool {
     })
 }
 
+fn format_error_chain(error: &(dyn Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        message.push_str(": ");
+        message.push_str(&error.to_string());
+        source = error.source();
+    }
+    message
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{OBJECT_KEY_PREFIX, default_temp_directory};
+    use super::{OBJECT_KEY_PREFIX, default_temp_directory, format_error_chain};
+    use std::fmt;
     use std::path::PathBuf;
+
+    #[derive(Debug)]
+    struct TestError {
+        message: &'static str,
+        source: Option<Box<dyn std::error::Error>>,
+    }
+
+    impl fmt::Display for TestError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for TestError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source.as_deref()
+        }
+    }
 
     #[test]
     fn object_prefix_is_slash_terminated() {
@@ -294,6 +330,25 @@ mod tests {
         assert_eq!(
             default_temp_directory(),
             PathBuf::from("/var/tmp/reposnake")
+        );
+    }
+
+    #[test]
+    fn formats_error_source_chain() {
+        let error = TestError {
+            message: "dispatch failure",
+            source: Some(Box::new(TestError {
+                message: "dns error",
+                source: Some(Box::new(TestError {
+                    message: "failed to resolve host",
+                    source: None,
+                })),
+            })),
+        };
+
+        assert_eq!(
+            format_error_chain(&error),
+            "dispatch failure: dns error: failed to resolve host"
         );
     }
 }

@@ -31,13 +31,15 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let log_filter = if cli.debug {
+    let default_log_filter = if cli.debug {
         "reposnake=debug,tower_http=info,axum::rejection=trace"
     } else {
         "reposnake=info,tower_http=info,axum::rejection=info"
     };
+    let log_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_filter));
     tracing_subscriber::registry()
-        .with(EnvFilter::new(log_filter))
+        .with(log_filter)
         .with(tracing_subscriber::fmt::layer().compact())
         .init();
 

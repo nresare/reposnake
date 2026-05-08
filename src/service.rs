@@ -3,12 +3,14 @@
 
 use crate::auth;
 use crate::config::{Config, IdentityProviderConfig, PublisherConfig};
+use crate::embed::StaticFile;
 use crate::error::AppError;
 use crate::oci::{DOCKER_DISTRIBUTION_API_VERSION, OciRegistry};
 use crate::package::{
     FileRecord, ProjectIndex, ProjectSummary, SIMPLE_API_VERSION, UploadPackage, normalize_name,
 };
 use crate::repository::PackageRepository;
+use crate::web::Templates;
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
@@ -35,6 +37,7 @@ pub struct AppState {
     pub subject_validator: SubjectValidator,
     pub publishers: Arc<Vec<PublisherConfig>>,
     pub max_upload_bytes: usize,
+    pub templates: Templates,
 }
 
 pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Result<AppState> {
@@ -46,6 +49,7 @@ pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Res
         subject_validator: SubjectValidator::new(config.identity_providers.clone(), disable_auth),
         publishers: Arc::new(config.publishers.clone()),
         max_upload_bytes: config.max_upload_bytes,
+        templates: Templates::new()?,
     })
 }
 
@@ -70,6 +74,7 @@ pub fn build_router(state: AppState) -> Router {
                 .put(oci_dispatch)
                 .patch(oci_dispatch),
         )
+        .route("/static/{*path}", get(static_file))
         .route("/packages/{project}/{filename}", get(download_package))
         .route("/{project}", get(simple_project_redirect))
         .route("/{project}/", get(simple_project))
@@ -87,6 +92,10 @@ pub fn build_router(state: AppState) -> Router {
 
 async fn healthz() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+async fn static_file(Path(path): Path<String>) -> StaticFile<String> {
+    StaticFile(path)
 }
 
 async fn oci_api_version_check(method: Method) -> Result<Response, AppError> {
@@ -218,7 +227,7 @@ async fn simple_root(
     if wants_json(&headers) {
         simple_json_response(&ProjectListJson::from(projects))
     } else {
-        simple_html_response(&headers, render_project_list(&projects))
+        simple_html_response(&headers, render_project_list(&state.templates, &projects)?)
     }
 }
 
@@ -236,7 +245,7 @@ async fn simple_project(
     if wants_json(&headers) {
         simple_json_response(&ProjectDetailJson::from(project))
     } else {
-        simple_html_response(&headers, render_project_detail(&project))
+        simple_html_response(&headers, render_project_detail(&state.templates, &project)?)
     }
 }
 
@@ -921,57 +930,91 @@ fn simple_json_response<T: Serialize>(body: &T) -> Result<Response, AppError> {
         .map_err(|error| AppError::Internal(format!("failed to build JSON response: {error}")))
 }
 
-fn render_project_list(projects: &[ProjectSummary]) -> String {
-    let mut html = simple_html_start("reposnake projects");
-    for project in projects {
-        html.push_str("<a href=\"/");
-        html.push_str(&escape_html_attr(&project.normalized_name));
-        html.push_str("/\">");
-        html.push_str(&escape_html_text(&project.name));
-        html.push_str("</a>\n");
-    }
-    html.push_str("</body>\n</html>\n");
-    html
+fn render_project_list(
+    templates: &Templates,
+    projects: &[ProjectSummary],
+) -> Result<String, AppError> {
+    let projects = projects
+        .iter()
+        .map(ProjectSummaryTemplate::from)
+        .collect::<Vec<_>>();
+    templates
+        .render(
+            "index",
+            &ProjectListTemplate {
+                simple_api_version: SIMPLE_API_VERSION,
+                projects,
+            },
+        )
+        .map_err(|error| AppError::Internal(format!("failed to render project list: {error}")))
 }
 
-fn render_project_detail(project: &ProjectIndex) -> String {
-    let mut html = simple_html_start(&project.normalized_name);
-    for file in &project.files {
-        html.push_str("<a href=\"");
-        html.push_str(&escape_html_attr(&url_path_segment(&file.filename)));
-        html.push_str("#sha256=");
-        html.push_str(&escape_html_attr(&file.sha256));
-        html.push('"');
-        if let Some(requires_python) = &file.requires_python {
-            html.push_str(" data-requires-python=\"");
-            html.push_str(&escape_html_attr(requires_python));
-            html.push('"');
+fn render_project_detail(
+    templates: &Templates,
+    project: &ProjectIndex,
+) -> Result<String, AppError> {
+    let files = project
+        .files
+        .iter()
+        .map(ProjectFileTemplate::from)
+        .collect::<Vec<_>>();
+    templates
+        .render(
+            "project",
+            &ProjectDetailTemplate {
+                simple_api_version: SIMPLE_API_VERSION,
+                title: &project.normalized_name,
+                files,
+            },
+        )
+        .map_err(|error| AppError::Internal(format!("failed to render project detail: {error}")))
+}
+
+#[derive(Serialize)]
+struct ProjectListTemplate {
+    simple_api_version: &'static str,
+    projects: Vec<ProjectSummaryTemplate>,
+}
+
+#[derive(Serialize)]
+struct ProjectSummaryTemplate {
+    name: String,
+    normalized_name: String,
+}
+
+impl From<&ProjectSummary> for ProjectSummaryTemplate {
+    fn from(project: &ProjectSummary) -> Self {
+        Self {
+            name: project.name.clone(),
+            normalized_name: project.normalized_name.clone(),
         }
-        html.push('>');
-        html.push_str(&escape_html_text(&file.filename));
-        html.push_str("</a>\n");
     }
-    html.push_str("</body>\n</html>\n");
-    html
 }
 
-fn simple_html_start(title: &str) -> String {
-    format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n<meta name=\"pypi:repository-version\" content=\"{}\">\n<title>{}</title>\n</head>\n<body>\n",
-        SIMPLE_API_VERSION,
-        escape_html_text(title)
-    )
+#[derive(Serialize)]
+struct ProjectDetailTemplate<'a> {
+    simple_api_version: &'static str,
+    title: &'a str,
+    files: Vec<ProjectFileTemplate>,
 }
 
-fn escape_html_text(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+#[derive(Serialize)]
+struct ProjectFileTemplate {
+    filename: String,
+    url: String,
+    sha256: String,
+    requires_python: Option<String>,
 }
 
-fn escape_html_attr(value: &str) -> String {
-    escape_html_text(value).replace('"', "&quot;")
+impl From<&FileRecord> for ProjectFileTemplate {
+    fn from(file: &FileRecord) -> Self {
+        Self {
+            filename: file.filename.clone(),
+            url: url_path_segment(&file.filename),
+            sha256: file.sha256.clone(),
+            requires_python: file.requires_python.clone(),
+        }
+    }
 }
 
 fn url_path_segment(value: &str) -> String {
@@ -1082,6 +1125,7 @@ mod tests {
     use crate::oci::OciRegistry;
     use crate::package::SIMPLE_API_VERSION;
     use crate::repository::PackageRepository;
+    use crate::web::Templates;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
     use base64::Engine;
@@ -1177,6 +1221,12 @@ mod tests {
             response.headers()[header::CONTENT_TYPE],
             "text/html; charset=utf-8"
         );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<h1>reposnake</h1>"));
+        assert!(body.contains("Using this repository"));
+        assert!(body.contains("pip install --extra-index-url"));
+        assert!(body.contains("href=\"/static/index.css\""));
 
         let response = app
             .oneshot(
@@ -1193,6 +1243,30 @@ mod tests {
             response.headers()[header::CONTENT_TYPE],
             "application/vnd.pypi.simple.v1+html; charset=utf-8"
         );
+    }
+
+    #[tokio::test]
+    async fn static_css_is_served_from_embedded_assets() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = unauthenticated_state(tempdir.path()).await;
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/static/index.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/css");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("--background"));
+        assert!(body.contains(".project-link"));
     }
 
     #[tokio::test]
@@ -1430,6 +1504,7 @@ mod tests {
             subject_validator: SubjectValidator::new(Vec::new(), true),
             publishers: Arc::new(Vec::new()),
             max_upload_bytes: 1024 * 1024,
+            templates: Templates::new().unwrap(),
         }
     }
 
@@ -1453,6 +1528,7 @@ mod tests {
                 required_claims: BTreeMap::from([("pipeline".to_string(), "ci".to_string())]),
             }]),
             max_upload_bytes: 1024 * 1024,
+            templates: Templates::new().unwrap(),
         }
     }
 

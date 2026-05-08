@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="pypi:repository-version" content="{{simple_api_version}}">
+<title>reposnake projects</title>
+<link rel="stylesheet" href="/static/index.css">
+</head>
+<body>
+<main>
+<section class="hero">
+<p class="eyebrow">Python package repository</p>
+<h1>reposnake</h1>
+<p class="lede">reposnake is a small package repository for Python distribution files. Python clients can install from this root Simple API, while publishers upload packages through the Twine-compatible <code>/legacy/</code> endpoint.</p>
+</section>
+<section class="usage" aria-labelledby="usage-title">
+<h2 id="usage-title">Using this repository</h2>
+<div class="usage-grid">
+<div>
+<h3>Install Python packages</h3>
+<pre><code>pip install --extra-index-url http://localhost:8080 example-package</code></pre>
+</div>
+<div>
+<h3>Upload with Twine</h3>
+<pre><code>twine upload \
+  --repository-url http://localhost:8080/legacy/ \
+  --username __token__ \
+  --password "$UPLOAD_JWT" \
+  dist/*</code></pre>
+</div>
+</div>
+<p class="note">Downloads are public. Uploads use a JWT supplied as the Twine password.</p>
+</section>
+<section class="projects" aria-labelledby="projects-title">
+<h2 id="projects-title">Projects</h2>
+{{#if projects}}
+{{#each projects}}
+<a class="project-link" href="/{{normalized_name}}/">{{name}}</a>
+{{/each}}
+{{else}}
+<p class="empty">No Python projects have been uploaded yet.</p>
+{{/if}}
+</section>
+</main>
+</body>
+</html>

@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="pypi:repository-version" content="{{simple_api_version}}">
+<title>{{title}}</title>
+<link rel="stylesheet" href="/static/index.css">
+</head>
+<body>
+{{#each files}}
+<a href="{{url}}#sha256={{sha256}}"{{#if requires_python}} data-requires-python="{{requires_python}}"{{/if}}>{{filename}}</a>
+{{/each}}
+</body>
+</html>

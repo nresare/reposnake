@@ -17,8 +17,11 @@ axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
 clap = { version = "4.6", features = ["derive"] }
 hex = "0.4"
+handlebars = "6.4"
 jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
+mime_guess = "2.0"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+rust-embed = "8.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"

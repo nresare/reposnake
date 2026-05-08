@@ -1,0 +1,156 @@
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+}
+
+:root {
+    color-scheme: light;
+    --background: #f8f6f2;
+    --surface-soft: #efebe4;
+    --text: #30312e;
+    --muted: #707369;
+    --border: #ddd6cb;
+    --accent: #6d8c7d;
+    --accent-strong: #4f6f62;
+    --code: #343732;
+}
+
+html {
+    font-size: 16px;
+}
+
+body {
+    margin: 0;
+    background: var(--background);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+main {
+    width: min(100% - 2rem, 50rem);
+    margin: 0 auto;
+    padding: 4.5rem 0;
+}
+
+.hero {
+    padding-bottom: 2.25rem;
+}
+
+.eyebrow {
+    margin: 0 0 0.75rem;
+    color: var(--accent-strong);
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0;
+    text-transform: uppercase;
+}
+
+h1,
+h2,
+h3,
+p {
+    margin-top: 0;
+}
+
+h1 {
+    margin-bottom: 1rem;
+    font-size: clamp(2.5rem, 8vw, 4.25rem);
+    font-weight: 620;
+    line-height: 1;
+}
+
+h2 {
+    margin-bottom: 1rem;
+    font-size: 1.25rem;
+    font-weight: 650;
+}
+
+h3 {
+    margin-bottom: 0.5rem;
+    font-size: 0.95rem;
+    font-weight: 650;
+}
+
+.lede {
+    max-width: 42rem;
+    margin-bottom: 0;
+    color: var(--muted);
+    font-size: 1.08rem;
+}
+
+.usage,
+.projects {
+    padding: 2rem 0;
+    border-top: 1px solid var(--border);
+}
+
+.usage-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+    gap: 1rem;
+}
+
+.usage-grid > div {
+    min-width: 0;
+}
+
+pre {
+    margin: 0;
+    padding: 0.9rem;
+    border-radius: 8px;
+    background: var(--code);
+    color: #fafaf7;
+    font-size: 0.84rem;
+    line-height: 1.55;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
+code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+p code {
+    padding: 0.08rem 0.28rem;
+    border-radius: 5px;
+    background: var(--surface-soft);
+    color: var(--text);
+    font-size: 0.95em;
+}
+
+.note,
+.empty {
+    margin: 1rem 0 0;
+    color: var(--muted);
+}
+
+.project-link {
+    display: inline-flex;
+    align-items: center;
+    min-height: 2.25rem;
+    margin: 0 0.5rem 0.5rem 0;
+    padding: 0.42rem 0.7rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--surface-soft);
+    color: var(--accent-strong);
+    font-weight: 650;
+    text-decoration: none;
+}
+
+.project-link:hover {
+    border-color: var(--accent);
+    color: var(--accent-strong);
+}
+
+body > a {
+    display: block;
+    width: min(100% - 2rem, 54rem);
+    margin: 0.75rem auto;
+    color: var(--accent-strong);
+    font-weight: 650;
+}

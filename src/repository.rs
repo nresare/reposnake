@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: The reposnake contributors
 
-use crate::config::{ObjectStoreBackend, ObjectStoreConfig, PersistenceConfig};
+use crate::config::{MetadataStoreConfig, ObjectStoreBackend, ObjectStoreConfig};
 use crate::error::AppError;
-use crate::metadata::{SharedMetadataStore, SurrealMetadataStore};
+use crate::metadata::{SharedMetadataStore, SurrealMetadataStore, build_metadata_store};
 use crate::object_store::{
     SharedObjectStore, build_object_store, migrate_filesystem_objects_to_store,
 };
@@ -44,10 +44,10 @@ impl PackageRepository {
     }
 
     pub async fn from_config(
-        persistence: &PersistenceConfig,
+        metadata_store: &MetadataStoreConfig,
         object_store: &ObjectStoreConfig,
     ) -> anyhow::Result<Self> {
-        let metadata = Arc::new(SurrealMetadataStore::from_config(persistence).await?);
+        let metadata = build_metadata_store(metadata_store).await?;
         let objects = build_object_store(object_store).await?;
         if object_store.backend == ObjectStoreBackend::S3
             && object_store.bucket.is_some()
@@ -200,6 +200,7 @@ fn sha256_bytes(hex_digest: &str) -> Result<[u8; 32], AppError> {
 #[cfg(test)]
 mod tests {
     use super::PackageRepository;
+    use crate::config::Config;
     use crate::package::UploadPackage;
 
     #[tokio::test]
@@ -258,5 +259,59 @@ mod tests {
             error.to_string(),
             "file 'reposnake_demo-0.1.0.tar.gz' already exists"
         );
+    }
+
+    #[tokio::test]
+    async fn filesystem_metadata_persists_uploaded_package_index() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let metadata_dir = tempdir.path().join("metadata");
+        let objects_dir = tempdir.path().join("objects");
+        let config: Config = toml::from_str(&format!(
+            r#"
+[metadata-store]
+backend = "filesystem"
+directory = "{}"
+
+[object-store]
+directory = "{}"
+
+[[publisher]]
+projects = ["*"]
+"#,
+            metadata_dir.display(),
+            objects_dir.display()
+        ))
+        .unwrap();
+        config.validate(true).unwrap();
+        let repository =
+            PackageRepository::from_config(&config.metadata_store, &config.object_store)
+                .await
+                .unwrap();
+
+        repository
+            .store_upload(UploadPackage {
+                name: "reposnake_demo".to_string(),
+                version: "0.1.0".to_string(),
+                filename: "reposnake_demo-0.1.0.tar.gz".to_string(),
+                content: b"package-content".to_vec(),
+                provided_sha256: None,
+                has_any_digest: true,
+                requires_python: Some(">=3.11".to_string()),
+            })
+            .await
+            .unwrap();
+        let reopened = PackageRepository::from_config(&config.metadata_store, &config.object_store)
+            .await
+            .unwrap();
+
+        let project = reopened.project("reposnake-demo").await.unwrap();
+        let (content, file) = reopened
+            .read_file("reposnake-demo", "reposnake_demo-0.1.0.tar.gz")
+            .await
+            .unwrap();
+
+        assert_eq!(project.files[0].filename, "reposnake_demo-0.1.0.tar.gz");
+        assert_eq!(content, b"package-content");
+        assert_eq!(file.requires_python.as_deref(), Some(">=3.11"));
     }
 }

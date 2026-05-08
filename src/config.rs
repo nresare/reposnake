@@ -18,7 +18,7 @@ pub struct Config {
     #[serde(default = "default_max_upload_bytes")]
     pub max_upload_bytes: usize,
     #[serde(default)]
-    pub persistence: PersistenceConfig,
+    pub metadata_store: MetadataStoreConfig,
     #[serde(default)]
     pub object_store: ObjectStoreConfig,
     #[serde(rename = "identity-provider", default)]
@@ -54,12 +54,24 @@ pub struct PublisherConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct PersistenceConfig {
-    #[serde(default = "default_persistence_uri")]
+pub struct MetadataStoreConfig {
+    #[serde(default)]
+    pub backend: MetadataStoreBackend,
+    #[serde(default = "default_metadata_store_uri")]
     pub uri: String,
+    pub directory: Option<PathBuf>,
     pub username: Option<String>,
     password_file: Option<Box<Path>>,
     pub idmouse: Option<IdmouseConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+#[derive(Default)]
+pub enum MetadataStoreBackend {
+    #[default]
+    Surrealdb,
+    Filesystem,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,7 +114,7 @@ impl Config {
         if self.max_upload_bytes == 0 {
             anyhow::bail!("max-upload-bytes must be greater than 0");
         }
-        self.persistence.validate()?;
+        self.metadata_store.validate()?;
         self.object_store.validate()?;
         if !disable_auth {
             if self.identity_providers.is_empty() {
@@ -168,10 +180,12 @@ impl Config {
     }
 }
 
-impl Default for PersistenceConfig {
+impl Default for MetadataStoreConfig {
     fn default() -> Self {
         Self {
-            uri: default_persistence_uri(),
+            backend: MetadataStoreBackend::Surrealdb,
+            uri: default_metadata_store_uri(),
+            directory: None,
             username: None,
             password_file: None,
             idmouse: None,
@@ -224,16 +238,44 @@ impl ObjectStoreConfig {
     }
 }
 
-impl PersistenceConfig {
+impl MetadataStoreConfig {
     fn validate(&self) -> anyhow::Result<()> {
+        if let Some(directory) = &self.directory
+            && directory.as_os_str().is_empty()
+        {
+            anyhow::bail!("metadata-store.directory must not be empty");
+        }
+        match self.backend {
+            MetadataStoreBackend::Filesystem => {
+                if self.directory.is_none() {
+                    anyhow::bail!(
+                        "metadata-store.directory is required when backend is filesystem"
+                    );
+                }
+                if self.username.is_some() || self.password_file.is_some() || self.idmouse.is_some()
+                {
+                    anyhow::bail!(
+                        "metadata-store.username, metadata-store.password-file, and metadata-store.idmouse must not be set when backend is filesystem"
+                    );
+                }
+                return Ok(());
+            }
+            MetadataStoreBackend::Surrealdb => {
+                if self.directory.is_some() {
+                    anyhow::bail!(
+                        "metadata-store.directory must not be set when backend is surrealdb"
+                    );
+                }
+            }
+        }
         if self.uri.is_empty() {
-            anyhow::bail!("persistence.uri must not be empty");
+            anyhow::bail!("metadata-store.uri must not be empty");
         }
         if let Some(idmouse) = &self.idmouse {
             idmouse.validate()?;
             if self.username.is_some() || self.password_file.is_some() {
                 anyhow::bail!(
-                    "persistence.username and persistence.password-file must not be set when persistence.idmouse is configured"
+                    "metadata-store.username and metadata-store.password-file must not be set when metadata-store.idmouse is configured"
                 );
             }
             return Ok(());
@@ -242,7 +284,7 @@ impl PersistenceConfig {
             (Some(username), Some(_)) if !username.is_empty() => {}
             (None, None) => {}
             _ => anyhow::bail!(
-                "persistence.username and persistence.password-file must be set together"
+                "metadata-store.username and metadata-store.password-file must be set together"
             ),
         }
         Ok(())
@@ -259,10 +301,10 @@ impl PersistenceConfig {
 impl IdmouseConfig {
     fn validate(&self) -> anyhow::Result<()> {
         if self.url.is_empty() {
-            anyhow::bail!("persistence.idmouse.url must not be empty");
+            anyhow::bail!("metadata-store.idmouse.url must not be empty");
         }
         if self.token_path.as_os_str().is_empty() {
-            anyhow::bail!("persistence.idmouse.token-path must not be empty");
+            anyhow::bail!("metadata-store.idmouse.token-path must not be empty");
         }
         Ok(())
     }
@@ -320,7 +362,7 @@ fn default_max_upload_bytes() -> usize {
     100 * 1024 * 1024
 }
 
-fn default_persistence_uri() -> String {
+fn default_metadata_store_uri() -> String {
     "mem://".to_string()
 }
 
@@ -334,7 +376,7 @@ fn read_secret_file(path: &Path) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ObjectStoreBackend};
+    use super::{Config, MetadataStoreBackend, ObjectStoreBackend};
     use std::io::Write;
     use std::path::Path;
 
@@ -362,7 +404,7 @@ sub = "buildkite:deploy"
         config.validate(false).unwrap();
         assert_eq!(config.bind_address, "0.0.0.0:8080");
         assert_eq!(config.max_upload_bytes, 100 * 1024 * 1024);
-        assert_eq!(config.persistence.uri, "mem://");
+        assert_eq!(config.metadata_store.uri, "mem://");
         assert_eq!(config.identity_providers[0].name, "buildkite");
         assert_eq!(config.object_store.backend, ObjectStoreBackend::Filesystem);
         assert_eq!(
@@ -468,11 +510,11 @@ max_upload_bytes = 104857600
 directory = "/data"
 "#,
             r#"
-[persistence]
+[metadata-store]
 password_file = "/run/secrets/surrealdb-password"
 "#,
             r#"
-[persistence.idmouse]
+[metadata-store.idmouse]
 url = "http://localhost:9000/token"
 token_path = "/run/secrets/idmouse-bearer-token"
 "#,
@@ -559,10 +601,10 @@ bucket = "reposnake-packages"
     }
 
     #[test]
-    fn parses_persistence_config() {
+    fn parses_metadata_store_config() {
         let config: Config = toml::from_str(
             r#"
-[persistence]
+[metadata-store]
 uri = "ws://localhost:8000/"
 username = "reposnake"
 password-file = "/run/secrets/surrealdb-password"
@@ -574,18 +616,106 @@ projects = ["*"]
         .unwrap();
 
         config.validate(true).unwrap();
-        assert_eq!(config.persistence.uri, "ws://localhost:8000/");
-        assert_eq!(config.persistence.username.as_deref(), Some("reposnake"));
+        assert_eq!(config.metadata_store.uri, "ws://localhost:8000/");
+        assert_eq!(config.metadata_store.username.as_deref(), Some("reposnake"));
     }
 
     #[test]
-    fn parses_idmouse_persistence_config() {
+    fn parses_filesystem_metadata_store_config() {
         let config: Config = toml::from_str(
             r#"
-[persistence]
+[metadata-store]
+backend = "filesystem"
+directory = "/data/metadata"
+
+[[publisher]]
+projects = ["*"]
+"#,
+        )
+        .unwrap();
+
+        config.validate(true).unwrap();
+        assert_eq!(
+            config.metadata_store.backend,
+            MetadataStoreBackend::Filesystem
+        );
+        assert_eq!(
+            config.metadata_store.directory.as_deref(),
+            Some(Path::new("/data/metadata"))
+        );
+    }
+
+    #[test]
+    fn rejects_filesystem_metadata_store_without_directory() {
+        let config: Config = toml::from_str(
+            r#"
+[metadata-store]
+backend = "filesystem"
+
+[[publisher]]
+projects = ["*"]
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate(true).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "metadata-store.directory is required when backend is filesystem"
+        );
+    }
+
+    #[test]
+    fn rejects_metadata_store_directory_without_filesystem_backend() {
+        let config: Config = toml::from_str(
+            r#"
+[metadata-store]
+directory = "/data/metadata"
+
+[[publisher]]
+projects = ["*"]
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate(true).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "metadata-store.directory must not be set when backend is surrealdb"
+        );
+    }
+
+    #[test]
+    fn rejects_surrealdb_auth_for_filesystem_metadata_store() {
+        let config: Config = toml::from_str(
+            r#"
+[metadata-store]
+backend = "filesystem"
+directory = "/data/metadata"
+username = "reposnake"
+password-file = "/run/secrets/surrealdb-password"
+
+[[publisher]]
+projects = ["*"]
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate(true).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "metadata-store.username, metadata-store.password-file, and metadata-store.idmouse must not be set when backend is filesystem"
+        );
+    }
+
+    #[test]
+    fn parses_idmouse_metadata_store_config() {
+        let config: Config = toml::from_str(
+            r#"
+[metadata-store]
 uri = "ws://localhost:8000/"
 
-[persistence.idmouse]
+[metadata-store.idmouse]
 url = "http://localhost:9000/token"
 token-path = "/run/secrets/idmouse-bearer-token"
 
@@ -596,7 +726,7 @@ projects = ["*"]
         .unwrap();
 
         config.validate(true).unwrap();
-        let idmouse = config.persistence.idmouse.as_ref().unwrap();
+        let idmouse = config.metadata_store.idmouse.as_ref().unwrap();
         assert_eq!(idmouse.url, "http://localhost:9000/token");
         assert_eq!(
             idmouse.token_path.to_string_lossy(),
@@ -608,12 +738,12 @@ projects = ["*"]
     fn rejects_password_auth_when_idmouse_is_configured() {
         let config: Config = toml::from_str(
             r#"
-[persistence]
+[metadata-store]
 uri = "ws://localhost:8000/"
 username = "reposnake"
 password-file = "/run/secrets/surrealdb-password"
 
-[persistence.idmouse]
+[metadata-store.idmouse]
 url = "http://localhost:9000/token"
 token-path = "/run/secrets/idmouse-bearer-token"
 
@@ -626,17 +756,17 @@ projects = ["*"]
         let error = config.validate(true).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "persistence.username and persistence.password-file must not be set when persistence.idmouse is configured"
+            "metadata-store.username and metadata-store.password-file must not be set when metadata-store.idmouse is configured"
         );
     }
 
     #[test]
-    fn persistence_password_reads_and_trims_secret_file() {
+    fn metadata_store_password_reads_and_trims_secret_file() {
         let mut password_file = tempfile::NamedTempFile::new().unwrap();
         writeln!(password_file, "secret").unwrap();
         let config: Config = toml::from_str(&format!(
             r#"
-[persistence]
+[metadata-store]
 uri = "ws://localhost:8000/"
 username = "reposnake"
 password-file = "{}"
@@ -649,7 +779,7 @@ projects = ["*"]
         .unwrap();
 
         assert_eq!(
-            config.persistence.password().unwrap().as_deref(),
+            config.metadata_store.password().unwrap().as_deref(),
             Some("secret")
         );
     }

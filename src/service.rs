@@ -40,7 +40,7 @@ pub struct AppState {
 pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Result<AppState> {
     let object_directory = config.object_store.directory_or_default();
     Ok(AppState {
-        repository: PackageRepository::from_config(&config.persistence, &config.object_store)
+        repository: PackageRepository::from_config(&config.metadata_store, &config.object_store)
             .await?,
         oci_registry: OciRegistry::new(object_directory),
         subject_validator: SubjectValidator::new(config.identity_providers.clone(), disable_auth),

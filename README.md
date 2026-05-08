@@ -13,9 +13,6 @@ max-upload-bytes = 104857600
 [object-store]
 directory = "/data"
 
-[persistence]
-uri = "mem://"
-
 # Optional. For S3, credentials come from the ambient AWS provider chain,
 # such as AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_WEB_IDENTITY_TOKEN_FILE,
 # ECS/EC2 metadata, or IRSA. Set AWS_REGION in the environment.
@@ -23,13 +20,20 @@ uri = "mem://"
 # bucket = "reposnake-packages"
 # directory = "/data" # Optional migration source for existing filesystem objects.
 
+[metadata-store]
+uri = "mem://"
+
+# Optional. Store package metadata as JSON files instead of using SurrealDB.
+# backend = "filesystem"
+# directory = "/data/metadata"
+
 # For a SurrealDB server:
 # uri = "ws://localhost:8000/"
 # username = "reposnake"
 # password-file = "/run/secrets/surrealdb-password"
 #
 # Or authenticate to SurrealDB through idmouse:
-# [persistence.idmouse]
+# [metadata-store.idmouse]
 # url = "http://idmouse.example/token"
 # token-path = "/run/secrets/idmouse-bearer-token"
 

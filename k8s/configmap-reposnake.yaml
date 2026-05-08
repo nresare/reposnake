@@ -10,7 +10,7 @@ data:
     [object-store]
     directory = "/data"
 
-    [persistence]
+    [metadata-store]
     uri = "mem://"
 
     [[identity-provider]]

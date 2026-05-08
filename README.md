@@ -60,6 +60,8 @@ sub = "system:serviceaccount:build:publisher"
 repository = "example-package"
 ```
 
+An IPv4-any or IPv4-loopback `bind-address`, such as `0.0.0.0:8080` or `127.0.0.1:8080`, listens on both IPv4 and IPv6 when IPv6 is available.
+
 Project names in `projects` are normalized using the Python packaging rules for Python uploads, so `other_package` and `other-package` refer to the same project. The same list may also contain OCI repository names such as `team/image`. Use `projects = ["*"]` for a publisher policy that can upload any Python project or push any OCI repository.
 
 ## Installing

@@ -25,6 +25,7 @@ use tracing::Level;
 use tracing::{debug, info};
 
 const SIMPLE_HTML_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+html; charset=utf-8";
+const HTML_CONTENT_TYPE: &str = "text/html; charset=utf-8";
 const SIMPLE_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
 
 #[derive(Clone)]
@@ -217,7 +218,7 @@ async fn simple_root(
     if wants_json(&headers) {
         simple_json_response(&ProjectListJson::from(projects))
     } else {
-        simple_html_response(render_project_list(&projects))
+        simple_html_response(&headers, render_project_list(&projects))
     }
 }
 
@@ -235,7 +236,7 @@ async fn simple_project(
     if wants_json(&headers) {
         simple_json_response(&ProjectDetailJson::from(project))
     } else {
-        simple_html_response(render_project_detail(&project))
+        simple_html_response(&headers, render_project_detail(&project))
     }
 }
 
@@ -867,10 +868,45 @@ fn wants_json(headers: &HeaderMap) -> bool {
     best_json.unwrap_or(0.0) > best_html.unwrap_or(0.0)
 }
 
-fn simple_html_response(html: String) -> Result<Response, AppError> {
+fn wants_simple_html_content_type(headers: &HeaderMap) -> bool {
+    let Some(accept) = headers.get(header::ACCEPT) else {
+        return false;
+    };
+    let Ok(accept) = accept.to_str() else {
+        return false;
+    };
+
+    accept.split(',').any(|part| {
+        let mut segments = part.trim().split(';').map(str::trim);
+        let media_type = segments.next().unwrap_or("").to_ascii_lowercase();
+        if !matches!(
+            media_type.as_str(),
+            "application/vnd.pypi.simple.v1+html" | "application/vnd.pypi.simple.latest+html"
+        ) {
+            return false;
+        }
+
+        for segment in segments {
+            if let Some(raw_quality) = segment.strip_prefix("q=")
+                && let Ok(parsed_quality) = raw_quality.parse::<f32>()
+            {
+                return parsed_quality > 0.0;
+            }
+        }
+        true
+    })
+}
+
+fn simple_html_response(headers: &HeaderMap, html: String) -> Result<Response, AppError> {
+    let content_type = if wants_simple_html_content_type(headers) {
+        SIMPLE_HTML_CONTENT_TYPE
+    } else {
+        HTML_CONTENT_TYPE
+    };
+
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, SIMPLE_HTML_CONTENT_TYPE)
+        .header(header::CONTENT_TYPE, content_type)
         .body(Body::from(html))
         .map_err(|error| AppError::Internal(format!("failed to build HTML response: {error}")))
 }
@@ -1093,7 +1129,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers()[header::CONTENT_TYPE],
-            "application/vnd.pypi.simple.v1+html; charset=utf-8"
+            "text/html; charset=utf-8"
         );
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
@@ -1114,6 +1150,49 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"package-content");
+    }
+
+    #[tokio::test]
+    async fn simple_html_uses_browser_content_type_unless_simple_html_is_accepted() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = unauthenticated_state(tempdir.path()).await;
+        let app = build_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(
+                        header::ACCEPT,
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::ACCEPT, "application/vnd.pypi.simple.v1+html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/vnd.pypi.simple.v1+html; charset=utf-8"
+        );
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -46,10 +46,12 @@ impl IntoResponse for AppError {
             AppError::Internal(_) => {
                 error!(status = status.as_u16(), error = %message, "request failed");
             }
+            AppError::NotFound(_) => {
+                info!(status = status.as_u16(), error = %message, "request rejected");
+            }
             AppError::BadRequest(_)
             | AppError::Conflict(_)
             | AppError::Forbidden(_)
-            | AppError::NotFound(_)
             | AppError::PayloadTooLarge(_)
             | AppError::Unauthorized(_) => {
                 warn!(status = status.as_u16(), error = %message, "request rejected");

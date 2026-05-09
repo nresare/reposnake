@@ -5,8 +5,9 @@ edition = "2024"
 license = "MIT"
 
 [features]
-default = ["s3"]
+default = ["s3", "surrealdb"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
+surrealdb = ["dep:surrealdb"]
 
 [dependencies]
 anyhow = "1.0"
@@ -26,7 +27,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
 socket2 = "0.6"
-surrealdb = { version = "3.0", default-features = false, features = ["protocol-ws"] }
+surrealdb = { version = "3.0", default-features = false, features = ["protocol-ws"], optional = true }
 thiserror = "2.0"
 tokio = { version = "1.52", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync"] }
 toml = "1.1"

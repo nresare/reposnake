@@ -68,11 +68,19 @@ pub struct MetadataStoreConfig {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-#[derive(Default)]
 pub enum MetadataStoreBackend {
-    #[default]
     Surrealdb,
     Filesystem,
+}
+
+impl Default for MetadataStoreBackend {
+    fn default() -> Self {
+        if cfg!(feature = "surrealdb") {
+            Self::Surrealdb
+        } else {
+            Self::Filesystem
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -186,10 +194,15 @@ impl Config {
 
 impl Default for MetadataStoreConfig {
     fn default() -> Self {
+        let backend = MetadataStoreBackend::default();
         Self {
-            backend: MetadataStoreBackend::Surrealdb,
+            directory: if backend == MetadataStoreBackend::Filesystem {
+                Some(default_metadata_store_directory())
+            } else {
+                None
+            },
+            backend,
             uri: default_metadata_store_uri(),
-            directory: None,
             username: None,
             password_file: None,
             idmouse: None,
@@ -233,6 +246,9 @@ impl ObjectStoreConfig {
                 Ok(())
             }
             ObjectStoreBackend::S3 => {
+                if !cfg!(feature = "s3") {
+                    anyhow::bail!("object-store.backend = \"s3\" requires the s3 Cargo feature");
+                }
                 if self.bucket.is_none() {
                     anyhow::bail!("object-store.bucket is required when backend is s3");
                 }
@@ -265,6 +281,11 @@ impl MetadataStoreConfig {
                 return Ok(());
             }
             MetadataStoreBackend::Surrealdb => {
+                if !cfg!(feature = "surrealdb") {
+                    anyhow::bail!(
+                        "metadata-store.backend = \"surrealdb\" requires the surrealdb Cargo feature"
+                    );
+                }
                 if self.directory.is_some() {
                     anyhow::bail!(
                         "metadata-store.directory must not be set when backend is surrealdb"
@@ -360,6 +381,10 @@ fn default_bind_address() -> String {
 
 fn default_object_store_directory() -> PathBuf {
     "/data".into()
+}
+
+fn default_metadata_store_directory() -> PathBuf {
+    "/data/metadata".into()
 }
 
 fn default_max_upload_bytes() -> usize {
@@ -469,6 +494,7 @@ projects = ["*"]
         );
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn parses_s3_object_store_config() {
         let config: Config = toml::from_str(
@@ -592,6 +618,7 @@ projects = ["*"]
         assert!(config.validate(true).is_err());
     }
 
+    #[cfg(feature = "s3")]
     #[test]
     fn accepts_s3_object_store_without_directory() {
         let config: Config = toml::from_str(
@@ -643,6 +670,7 @@ bucket = "reposnake-packages"
         assert!(toml::from_str::<Config>(config).is_err());
     }
 
+    #[cfg(feature = "surrealdb")]
     #[test]
     fn parses_metadata_store_config() {
         let config: Config = toml::from_str(
@@ -714,6 +742,7 @@ projects = ["*"]
         );
     }
 
+    #[cfg(feature = "surrealdb")]
     #[test]
     fn rejects_metadata_store_directory_without_filesystem_backend() {
         let config: Config = toml::from_str(
@@ -761,6 +790,7 @@ projects = ["*"]
         );
     }
 
+    #[cfg(feature = "surrealdb")]
     #[test]
     fn parses_idmouse_metadata_store_config() {
         let config: Config = toml::from_str(
@@ -789,6 +819,7 @@ projects = ["*"]
         );
     }
 
+    #[cfg(feature = "surrealdb")]
     #[test]
     fn rejects_password_auth_when_idmouse_is_configured() {
         let config: Config = toml::from_str(

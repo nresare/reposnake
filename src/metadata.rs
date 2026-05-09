@@ -3,6 +3,7 @@
 
 use crate::config::{MetadataStoreBackend, MetadataStoreConfig};
 use crate::error::AppError;
+#[cfg(feature = "surrealdb")]
 use crate::idmouse::IdmouseClient;
 use crate::package::{FileRecord, ProjectIndex, ProjectSummary};
 use async_trait::async_trait;
@@ -11,13 +12,19 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(feature = "surrealdb")]
 use surrealdb::Surreal;
+#[cfg(feature = "surrealdb")]
 use surrealdb::engine::any;
+#[cfg(feature = "surrealdb")]
 use surrealdb::engine::any::Any;
+#[cfg(feature = "surrealdb")]
 use surrealdb::types::SurrealValue;
 use tokio::io::AsyncWriteExt;
 
+#[cfg(feature = "surrealdb")]
 const NAMESPACE: &str = "default";
+#[cfg(feature = "surrealdb")]
 const DATABASE: &str = "reposnake";
 
 pub type SharedMetadataStore = Arc<dyn MetadataStore>;
@@ -45,9 +52,7 @@ pub async fn build_metadata_store(
     config: &MetadataStoreConfig,
 ) -> anyhow::Result<SharedMetadataStore> {
     match config.backend {
-        MetadataStoreBackend::Surrealdb => {
-            Ok(Arc::new(SurrealMetadataStore::from_config(config).await?))
-        }
+        MetadataStoreBackend::Surrealdb => build_surreal_metadata_store(config).await,
         MetadataStoreBackend::Filesystem => {
             let directory = config.directory.clone().ok_or_else(|| {
                 anyhow::anyhow!("metadata-store.directory is required when backend is filesystem")
@@ -57,6 +62,21 @@ pub async fn build_metadata_store(
     }
 }
 
+#[cfg(feature = "surrealdb")]
+async fn build_surreal_metadata_store(
+    config: &MetadataStoreConfig,
+) -> anyhow::Result<SharedMetadataStore> {
+    Ok(Arc::new(SurrealMetadataStore::from_config(config).await?))
+}
+
+#[cfg(not(feature = "surrealdb"))]
+async fn build_surreal_metadata_store(
+    _config: &MetadataStoreConfig,
+) -> anyhow::Result<SharedMetadataStore> {
+    anyhow::bail!("metadata-store.backend = \"surrealdb\" requires the surrealdb Cargo feature");
+}
+
+#[cfg(feature = "surrealdb")]
 #[derive(Debug, Clone)]
 pub struct SurrealMetadataStore {
     db: Arc<Surreal<Any>>,
@@ -67,6 +87,7 @@ pub struct FilesystemMetadataStore {
     directory: PathBuf,
 }
 
+#[cfg(feature = "surrealdb")]
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 #[surreal(crate = "surrealdb::types")]
 struct ProjectDoc {
@@ -74,6 +95,7 @@ struct ProjectDoc {
     normalized_name: String,
 }
 
+#[cfg(feature = "surrealdb")]
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 #[surreal(crate = "surrealdb::types")]
 struct FileDoc {
@@ -85,8 +107,12 @@ struct FileDoc {
     requires_python: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
-#[surreal(crate = "surrealdb::types")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "surrealdb",
+    derive(SurrealValue),
+    surreal(crate = "surrealdb::types")
+)]
 pub struct OciUploadState {
     pub repository: String,
     pub uuid: String,
@@ -94,22 +120,31 @@ pub struct OciUploadState {
     pub content: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
-#[surreal(crate = "surrealdb::types")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "surrealdb",
+    derive(SurrealValue),
+    surreal(crate = "surrealdb::types")
+)]
 pub struct OciManifestRecord {
     pub repository: String,
     pub digest: String,
     pub media_type: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
-#[surreal(crate = "surrealdb::types")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "surrealdb",
+    derive(SurrealValue),
+    surreal(crate = "surrealdb::types")
+)]
 pub struct OciTagRecord {
     pub repository: String,
     pub tag: String,
     pub digest: String,
 }
 
+#[cfg(feature = "surrealdb")]
 impl SurrealMetadataStore {
     pub async fn in_memory() -> anyhow::Result<Self> {
         Ok(Self::new(mem_db().await?))
@@ -307,6 +342,7 @@ impl FilesystemMetadataStore {
     }
 }
 
+#[cfg(feature = "surrealdb")]
 pub async fn make_db(config: &MetadataStoreConfig) -> anyhow::Result<Arc<Surreal<Any>>> {
     let db = Arc::new(any::connect(&config.uri).await?);
     if let Some(idmouse) = config.idmouse.clone() {
@@ -326,20 +362,21 @@ pub async fn make_db(config: &MetadataStoreConfig) -> anyhow::Result<Arc<Surreal
     Ok(db)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "surrealdb"))]
 pub async fn mem_db() -> anyhow::Result<Arc<Surreal<Any>>> {
     let db = Arc::new(any::connect("mem://").await?);
     setup_db(db.as_ref()).await?;
     Ok(db)
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), feature = "surrealdb"))]
 async fn mem_db() -> anyhow::Result<Arc<Surreal<Any>>> {
     let db = Arc::new(any::connect("mem://").await?);
     setup_db(db.as_ref()).await?;
     Ok(db)
 }
 
+#[cfg(feature = "surrealdb")]
 async fn setup_db(db: &Surreal<Any>) -> anyhow::Result<()> {
     db.use_ns(NAMESPACE).use_db(DATABASE).await?;
     db.query(
@@ -359,6 +396,7 @@ async fn setup_db(db: &Surreal<Any>) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "surrealdb")]
 impl SurrealMetadataStore {
     async fn files_for_project(
         &self,
@@ -393,6 +431,7 @@ impl SurrealMetadataStore {
     }
 }
 
+#[cfg(feature = "surrealdb")]
 #[async_trait]
 impl MetadataStore for SurrealMetadataStore {
     async fn list_projects(&self) -> Result<Vec<ProjectSummary>, AppError> {
@@ -734,14 +773,17 @@ impl MetadataStore for FilesystemMetadataStore {
     }
 }
 
+#[cfg(feature = "surrealdb")]
 fn file_id(normalized_project: &str, filename: &str) -> String {
     format!("{normalized_project}/{filename}")
 }
 
+#[cfg(feature = "surrealdb")]
 fn oci_manifest_id(repository: &str, digest: &str) -> String {
     format!("{}/{}", encode_oci_key(repository), encode_oci_key(digest))
 }
 
+#[cfg(feature = "surrealdb")]
 fn oci_tag_id(repository: &str, tag: &str) -> String {
     format!("{}/{}", encode_oci_key(repository), encode_oci_key(tag))
 }
@@ -763,10 +805,13 @@ async fn remove_file_if_exists(path: PathBuf) -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilesystemMetadataStore, MetadataStore, SurrealMetadataStore};
+    #[cfg(feature = "surrealdb")]
+    use super::SurrealMetadataStore;
+    use super::{FilesystemMetadataStore, MetadataStore};
     use crate::error::AppError;
     use crate::package::{FileRecord, ProjectSummary};
 
+    #[cfg(feature = "surrealdb")]
     #[tokio::test]
     async fn embedded_store_starts_with_no_projects() -> anyhow::Result<()> {
         let store = SurrealMetadataStore::in_memory().await?;
@@ -775,6 +820,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "surrealdb")]
     #[tokio::test]
     async fn embedded_store_adds_and_reads_simple_project_detail() -> anyhow::Result<()> {
         let store = SurrealMetadataStore::in_memory().await?;
@@ -795,6 +841,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "surrealdb")]
     #[tokio::test]
     async fn embedded_store_lists_projects_and_files_in_simple_api_order() -> anyhow::Result<()> {
         let store = SurrealMetadataStore::in_memory().await?;
@@ -838,6 +885,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "surrealdb")]
     #[tokio::test]
     async fn embedded_store_rejects_duplicate_file_for_project() -> anyhow::Result<()> {
         let store = SurrealMetadataStore::in_memory().await?;
@@ -852,6 +900,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "surrealdb")]
     #[tokio::test]
     async fn embedded_store_returns_not_found_for_unknown_project() -> anyhow::Result<()> {
         let store = SurrealMetadataStore::in_memory().await?;

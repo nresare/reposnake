@@ -394,7 +394,9 @@ fn digest_sha256_bytes(digest: &str) -> Result<[u8; 32], AppError> {
 #[cfg(test)]
 mod tests {
     use super::{OciRegistry, is_valid_repository_name};
-    use crate::metadata::{FilesystemMetadataStore, SurrealMetadataStore};
+    use crate::metadata::FilesystemMetadataStore;
+    #[cfg(feature = "surrealdb")]
+    use crate::metadata::SurrealMetadataStore;
     use crate::object_store::FilesystemObjectStore;
     use std::sync::Arc;
 
@@ -407,6 +409,7 @@ mod tests {
         assert!(!is_valid_repository_name("team//image"));
     }
 
+    #[cfg(feature = "surrealdb")]
     #[tokio::test]
     async fn stores_blob_and_manifest() {
         let tempdir = tempfile::tempdir().unwrap();

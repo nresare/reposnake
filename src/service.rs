@@ -940,6 +940,10 @@ fn render_project_list(
     origin: &str,
     projects: &[ProjectSummary],
 ) -> Result<String, AppError> {
+    let example_project = projects
+        .first()
+        .map(|project| project.normalized_name.as_str())
+        .unwrap_or("example-package");
     let projects = projects
         .iter()
         .map(ProjectSummaryTemplate::from)
@@ -950,6 +954,7 @@ fn render_project_list(
             &ProjectListTemplate {
                 simple_api_version: SIMPLE_API_VERSION,
                 origin,
+                example_project,
                 projects,
             },
         )
@@ -981,6 +986,7 @@ fn render_project_detail(
 struct ProjectListTemplate<'a> {
     simple_api_version: &'static str,
     origin: &'a str,
+    example_project: &'a str,
     projects: Vec<ProjectSummaryTemplate>,
 }
 
@@ -1188,6 +1194,8 @@ mod tests {
         assert!(body.contains(&format!(
             "pypi:repository-version\" content=\"{SIMPLE_API_VERSION}"
         )));
+        assert!(body.contains("<main>"));
+        assert!(body.contains("<h1 id=\"project-title\">reposnake-demo</h1>"));
         assert!(body.contains("href=\"reposnake_demo-0.1.0.tar.gz#sha256="));
 
         let response = app
@@ -1233,8 +1241,12 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("reposnake"));
         assert!(body.contains("Using this repository"));
-        assert!(body.contains("pip install --extra-index-url https://packages.example"));
+        assert!(
+            body.contains("pip install --extra-index-url https://packages.example example-package")
+        );
+        assert!(body.contains("class=\"copy-button\""));
         assert!(body.contains("href=\"/static/index.css\""));
+        assert!(body.contains("src=\"/static/index.js\""));
 
         let response = app
             .oneshot(
@@ -1254,12 +1266,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn static_css_is_served_from_embedded_assets() {
+    async fn simple_html_uses_first_project_in_install_example() {
         let tempdir = tempfile::tempdir().unwrap();
         let state = unauthenticated_state(tempdir.path()).await;
         let app = build_router(state);
 
         let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/legacy/")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "multipart/form-data; boundary=reposnake-boundary",
+                    )
+                    .body(Body::from(multipart_upload_body(
+                        "reposnake_demo",
+                        "0.1.0",
+                        b"package-content",
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("pip install --extra-index-url https://packages.example reposnake-demo")
+        );
+    }
+
+    #[tokio::test]
+    async fn static_assets_are_served_from_embedded_assets() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = unauthenticated_state(tempdir.path()).await;
+        let app = build_router(state);
+
+        let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/static/index.css")
@@ -1275,6 +1327,28 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("--background"));
         assert!(body.contains(".project-link"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/static/index.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .contains("javascript")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("navigator.clipboard.writeText"));
+        assert!(body.contains("copied"));
     }
 
     #[tokio::test]

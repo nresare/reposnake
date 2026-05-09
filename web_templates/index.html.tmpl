@@ -13,17 +13,20 @@
 <p class="eyebrow">Python package repository</p>
 <h1>reposnake 🐍</h1>
 <p class="lede">reposnake is a small service that you can use to set up your own repository for Python packages.
-It is built to be used by popular package management tools such as <a href="https://pip.pypa.io/en/stable/">pip</a>
-and <a href="https://docs.astral.sh/uv/">uv</a>. It also supports publishing using with short lived credentials
+It is built to be used by popular package management tools such as <tt>pip</tt>
+and <tt>uv</tt>. It also supports publishing using with short lived credentials
 such as the tokens that are issued to GitHub actions workflows.
-<br/>For more information please see <a href="https://github.com/nresare/reposnake">https://github.com/nresare/reposnake</a></p>
+For more information please see <a href="https://github.com/nresare/reposnake">https://github.com/nresare/reposnake</a></p>
 </section>
 <section class="usage" aria-labelledby="usage-title">
 <h2 id="usage-title">Using this repository</h2>
 <div class="usage-grid">
 <div>
-<p>Add this repository to your tool configuration or pass as an argument. For example, to install <code>example-package</code>:</p>
-<pre><code>pip install --extra-index-url {{origin}} example-package</code></pre>
+<p>Add this repository to your tool configuration or pass as an argument. For example, to install <code>{{example_project}}</code>:</p>
+<div class="command">
+<button class="copy-button" type="button" data-copy-target="install-command">copy</button>
+<pre><code>pip install --extra-index-url {{origin}} {{example_project}}</code></pre>
+</div>
 </div>
 </div>
 </section>
@@ -38,5 +41,6 @@ such as the tokens that are issued to GitHub actions workflows.
 {{/if}}
 </section>
 </main>
+<script src="/static/index.js"></script>
 </body>
 </html>

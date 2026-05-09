@@ -17,6 +17,7 @@ directory = "/data"
 uri = "mem://"
 
 # Optional. Store package metadata as JSON files instead of using SurrealDB.
+# This is required for builds made with `cargo build --no-default-features`.
 # backend = "filesystem"
 # directory = "/data/metadata"
 

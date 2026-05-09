@@ -132,6 +132,23 @@ cargo run -- --config-file reposnake.toml.example --disable-auth
 
 Use `--debug` to log detailed upload and authorization flow steps.
 
+## Build Features
+
+The `s3` and `surrealdb` Cargo features are enabled by default. Disable default
+features for a lean filesystem-only build:
+
+```sh
+cargo build --no-default-features
+```
+
+In that build, omit S3 configuration and use filesystem metadata:
+
+```toml
+[metadata-store]
+backend = "filesystem"
+directory = "/data/metadata"
+```
+
 ## License
 
 MIT

@@ -5,6 +5,7 @@ pub mod auth;
 pub mod config;
 pub mod embed;
 pub mod error;
+#[cfg(feature = "surrealdb")]
 pub mod idmouse;
 pub mod kubernetes;
 pub mod metadata;

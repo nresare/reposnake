@@ -3,7 +3,7 @@
 
 use crate::config::{MetadataStoreConfig, ObjectStoreBackend, ObjectStoreConfig};
 use crate::error::AppError;
-use crate::metadata::{SharedMetadataStore, SurrealMetadataStore, build_metadata_store};
+use crate::metadata::{FilesystemMetadataStore, SharedMetadataStore, build_metadata_store};
 use crate::object_store::{
     SharedObjectStore, build_object_store, migrate_filesystem_objects_to_store,
 };
@@ -33,10 +33,11 @@ impl std::fmt::Debug for PackageRepository {
 
 impl PackageRepository {
     pub async fn new(root: impl Into<PathBuf>) -> anyhow::Result<Self> {
-        let metadata = Arc::new(SurrealMetadataStore::in_memory().await?);
+        let root = root.into();
+        let metadata = Arc::new(FilesystemMetadataStore::new(root.join("metadata")));
         let object_store = ObjectStoreConfig {
             backend: ObjectStoreBackend::Filesystem,
-            directory: Some(root.into()),
+            directory: Some(root),
             bucket: None,
         };
         let objects = build_object_store(&object_store).await?;

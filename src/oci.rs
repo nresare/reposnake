@@ -49,7 +49,7 @@ impl OciRegistry {
             repository: repository.to_string(),
             uuid,
             size: 0,
-            content: Vec::new(),
+            sha256: None,
         };
         let _guard = self.write_lock.lock().await;
         self.metadata.create_oci_upload(state.clone()).await?;
@@ -64,8 +64,10 @@ impl OciRegistry {
     ) -> Result<OciUploadState, AppError> {
         let mut state = self.read_upload_state(repository, uuid).await?;
         let _guard = self.write_lock.lock().await;
-        state.content.extend_from_slice(&chunk);
+        let mut content = self.read_upload_content(&state).await?;
+        content.extend_from_slice(&chunk);
         state.size += chunk.len() as u64;
+        state.sha256 = Some(hex::encode(self.store_content_object(&content).await?));
         self.metadata.update_oci_upload(state.clone()).await?;
         Ok(state)
     }
@@ -78,8 +80,9 @@ impl OciRegistry {
         final_chunk: Bytes,
     ) -> Result<OciBlob, AppError> {
         validate_digest(digest)?;
-        let state = self.append_upload(repository, uuid, final_chunk).await?;
-        let content = state.content;
+        let state = self.read_upload_state(repository, uuid).await?;
+        let mut content = self.read_upload_content(&state).await?;
+        content.extend_from_slice(&final_chunk);
         let calculated = sha256_digest(&content);
         if calculated != digest {
             return Err(AppError::BadRequest(format!(
@@ -229,6 +232,13 @@ impl OciRegistry {
         self.metadata.oci_upload(repository, uuid).await
     }
 
+    async fn read_upload_content(&self, state: &OciUploadState) -> Result<Vec<u8>, AppError> {
+        let Some(sha256) = state.sha256.as_deref() else {
+            return Ok(Vec::new());
+        };
+        self.objects.read(&sha256_bytes(sha256)?).await
+    }
+
     async fn store_content_object(&self, content: &[u8]) -> Result<[u8; 32], AppError> {
         let mut writer = self.objects.create_writer().await?;
         if let Err(error) = writer.write_chunk(content).await {
@@ -327,6 +337,20 @@ fn sha256_digest(content: &[u8]) -> String {
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
+fn sha256_bytes(hex_digest: &str) -> Result<[u8; 32], AppError> {
+    let bytes = hex::decode(hex_digest).map_err(|error| {
+        AppError::Internal(format!(
+            "failed to decode OCI upload digest '{hex_digest}': {error}"
+        ))
+    })?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        AppError::Internal(format!(
+            "invalid OCI upload digest '{hex_digest}': expected 32 bytes, got {}",
+            bytes.len()
+        ))
+    })
+}
+
 fn uuid_v4() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -398,6 +422,9 @@ mod tests {
     #[cfg(feature = "surrealdb")]
     use crate::metadata::SurrealMetadataStore;
     use crate::object_store::FilesystemObjectStore;
+    use crate::package::UploadPackage;
+    use crate::repository::PackageRepository;
+    use sha2::{Digest as _, Sha256};
     use std::sync::Arc;
 
     #[test]
@@ -477,5 +504,46 @@ mod tests {
             read.media_type,
             "application/vnd.oci.image.manifest.v1+json"
         );
+    }
+
+    #[tokio::test]
+    async fn python_packages_and_oci_blobs_share_content_addressed_objects() -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let object_root = tempdir.path().join("objects");
+        let metadata = Arc::new(FilesystemMetadataStore::new(
+            tempdir.path().join("metadata"),
+        ));
+        let objects = Arc::new(FilesystemObjectStore::new(&object_root));
+        let repository = PackageRepository::from_stores(metadata.clone(), objects.clone());
+        let registry = OciRegistry::new(metadata, objects);
+        let content = b"shared-content".to_vec();
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&content)));
+
+        repository
+            .store_upload(UploadPackage {
+                name: "reposnake-demo".to_string(),
+                version: "0.1.0".to_string(),
+                filename: "reposnake_demo-0.1.0.tar.gz".to_string(),
+                content: content.clone(),
+                provided_sha256: None,
+                has_any_digest: true,
+                requires_python: None,
+            })
+            .await?;
+        registry
+            .store_blob("team/image", &digest, content.clone().into())
+            .await?;
+
+        let mut entries = tokio::fs::read_dir(&object_root).await?;
+        let mut object_count = 0;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_file() {
+                object_count += 1;
+                assert_eq!(tokio::fs::read(entry.path()).await?, content);
+            }
+        }
+
+        assert_eq!(object_count, 1);
+        Ok(())
     }
 }

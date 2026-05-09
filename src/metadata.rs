@@ -117,7 +117,7 @@ pub struct OciUploadState {
     pub repository: String,
     pub uuid: String,
     pub size: u64,
-    pub content: Vec<u8>,
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

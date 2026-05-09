@@ -8,6 +8,7 @@ It serves the Python Simple Repository API from the service root, stores uploade
 
 ```toml
 bind-address = "0.0.0.0:8080"
+origin = "http://localhost:8080"
 max-upload-bytes = 104857600
 
 [object-store]

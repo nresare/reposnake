@@ -268,6 +268,8 @@ mod tests {
         let objects_dir = tempdir.path().join("objects");
         let config: Config = toml::from_str(&format!(
             r#"
+origin = "http://localhost:8080"
+
 [metadata-store]
 backend = "filesystem"
 directory = "{}"

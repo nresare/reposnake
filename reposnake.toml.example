@@ -1,5 +1,6 @@
 bind-address = "0.0.0.0:8080"
 # IPv4-any and IPv4-loopback bind addresses listen on both IPv4 and IPv6 when IPv6 is available.
+origin = "http://localhost:8080"
 max-upload-bytes = 104857600
 
 [object-store]

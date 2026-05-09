@@ -38,6 +38,7 @@ pub struct AppState {
     pub publishers: Arc<Vec<PublisherConfig>>,
     pub max_upload_bytes: usize,
     pub templates: Templates,
+    pub origin: String,
 }
 
 pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Result<AppState> {
@@ -50,6 +51,7 @@ pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Res
         publishers: Arc::new(config.publishers.clone()),
         max_upload_bytes: config.max_upload_bytes,
         templates: Templates::new()?,
+        origin: config.origin.clone(),
     })
 }
 
@@ -227,7 +229,10 @@ async fn simple_root(
     if wants_json(&headers) {
         simple_json_response(&ProjectListJson::from(projects))
     } else {
-        simple_html_response(&headers, render_project_list(&state.templates, &projects)?)
+        simple_html_response(
+            &headers,
+            render_project_list(&state.templates, &state.origin, &projects)?,
+        )
     }
 }
 
@@ -932,6 +937,7 @@ fn simple_json_response<T: Serialize>(body: &T) -> Result<Response, AppError> {
 
 fn render_project_list(
     templates: &Templates,
+    origin: &str,
     projects: &[ProjectSummary],
 ) -> Result<String, AppError> {
     let projects = projects
@@ -943,6 +949,7 @@ fn render_project_list(
             "index",
             &ProjectListTemplate {
                 simple_api_version: SIMPLE_API_VERSION,
+                origin,
                 projects,
             },
         )
@@ -971,8 +978,9 @@ fn render_project_detail(
 }
 
 #[derive(Serialize)]
-struct ProjectListTemplate {
+struct ProjectListTemplate<'a> {
     simple_api_version: &'static str,
+    origin: &'a str,
     projects: Vec<ProjectSummaryTemplate>,
 }
 
@@ -1223,9 +1231,9 @@ mod tests {
         );
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("<h1>reposnake</h1>"));
+        assert!(body.contains("reposnake"));
         assert!(body.contains("Using this repository"));
-        assert!(body.contains("pip install --extra-index-url"));
+        assert!(body.contains("pip install --extra-index-url https://packages.example"));
         assert!(body.contains("href=\"/static/index.css\""));
 
         let response = app
@@ -1505,6 +1513,7 @@ mod tests {
             publishers: Arc::new(Vec::new()),
             max_upload_bytes: 1024 * 1024,
             templates: Templates::new().unwrap(),
+            origin: "https://packages.example".to_string(),
         }
     }
 
@@ -1529,6 +1538,7 @@ mod tests {
             }]),
             max_upload_bytes: 1024 * 1024,
             templates: Templates::new().unwrap(),
+            origin: "https://packages.example".to_string(),
         }
     }
 

@@ -2,13 +2,12 @@
 // SPDX-FileCopyrightText: The reposnake contributors
 
 use crate::error::AppError;
+use crate::metadata::{OciManifestRecord, OciTagRecord, OciUploadState, SharedMetadataStore};
+use crate::object_store::SharedObjectStore;
 use axum::body::Bytes;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 pub const DOCKER_DISTRIBUTION_API_VERSION: &str = "registry/2.0";
@@ -16,7 +15,8 @@ static UPLOAD_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct OciRegistry {
-    root: Arc<PathBuf>,
+    metadata: SharedMetadataStore,
+    objects: SharedObjectStore,
     write_lock: Arc<Mutex<()>>,
 }
 
@@ -33,48 +33,26 @@ pub struct OciManifest {
     pub media_type: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UploadState {
-    pub repository: String,
-    pub uuid: String,
-    pub size: u64,
-}
-
 impl OciRegistry {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
+    pub fn new(metadata: SharedMetadataStore, objects: SharedObjectStore) -> Self {
         Self {
-            root: Arc::new(root.into()),
+            metadata,
+            objects,
             write_lock: Arc::new(Mutex::new(())),
         }
     }
 
-    pub async fn start_upload(&self, repository: &str) -> Result<UploadState, AppError> {
+    pub async fn start_upload(&self, repository: &str) -> Result<OciUploadState, AppError> {
         validate_repository_name(repository)?;
         let uuid = uuid_v4();
-        let state = UploadState {
+        let state = OciUploadState {
             repository: repository.to_string(),
             uuid,
             size: 0,
+            content: Vec::new(),
         };
         let _guard = self.write_lock.lock().await;
-        tokio::fs::create_dir_all(self.uploads_dir())
-            .await
-            .map_err(|error| {
-                AppError::Internal(format!("failed to create OCI upload storage: {error}"))
-            })?;
-        tokio::fs::write(
-            self.upload_state_path(&state.uuid),
-            serialize_state(&state)?,
-        )
-        .await
-        .map_err(|error| {
-            AppError::Internal(format!("failed to create OCI upload state: {error}"))
-        })?;
-        tokio::fs::write(self.upload_content_path(&state.uuid), [])
-            .await
-            .map_err(|error| {
-                AppError::Internal(format!("failed to create OCI upload content: {error}"))
-            })?;
+        self.metadata.create_oci_upload(state.clone()).await?;
         Ok(state)
     }
 
@@ -83,38 +61,12 @@ impl OciRegistry {
         repository: &str,
         uuid: &str,
         chunk: Bytes,
-    ) -> Result<UploadState, AppError> {
+    ) -> Result<OciUploadState, AppError> {
         let mut state = self.read_upload_state(repository, uuid).await?;
         let _guard = self.write_lock.lock().await;
-        let path = self.upload_content_path(uuid);
-        let mut file = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .await
-            .map_err(|error| {
-                AppError::Internal(format!(
-                    "failed to open OCI upload '{}': {error}",
-                    path.display()
-                ))
-            })?;
-        file.write_all(&chunk).await.map_err(|error| {
-            AppError::Internal(format!(
-                "failed to append OCI upload '{}': {error}",
-                path.display()
-            ))
-        })?;
-        file.flush().await.map_err(|error| {
-            AppError::Internal(format!(
-                "failed to flush OCI upload '{}': {error}",
-                path.display()
-            ))
-        })?;
+        state.content.extend_from_slice(&chunk);
         state.size += chunk.len() as u64;
-        tokio::fs::write(self.upload_state_path(uuid), serialize_state(&state)?)
-            .await
-            .map_err(|error| {
-                AppError::Internal(format!("failed to update OCI upload state: {error}"))
-            })?;
+        self.metadata.update_oci_upload(state.clone()).await?;
         Ok(state)
     }
 
@@ -127,11 +79,7 @@ impl OciRegistry {
     ) -> Result<OciBlob, AppError> {
         validate_digest(digest)?;
         let state = self.append_upload(repository, uuid, final_chunk).await?;
-        let content = tokio::fs::read(self.upload_content_path(&state.uuid))
-            .await
-            .map_err(|error| {
-                AppError::Internal(format!("failed to read OCI upload content: {error}"))
-            })?;
+        let content = state.content;
         let calculated = sha256_digest(&content);
         if calculated != digest {
             return Err(AppError::BadRequest(format!(
@@ -140,24 +88,10 @@ impl OciRegistry {
         }
 
         let _guard = self.write_lock.lock().await;
-        let blob_path = self.blob_path(digest)?;
-        if let Some(parent) = blob_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                AppError::Internal(format!("failed to create OCI blob storage: {error}"))
-            })?;
-        }
-        if !path_exists(&blob_path).await? {
-            tokio::fs::write(&blob_path, &content)
-                .await
-                .map_err(|error| {
-                    AppError::Internal(format!(
-                        "failed to write OCI blob '{}': {error}",
-                        blob_path.display()
-                    ))
-                })?;
-        }
-        remove_if_exists(self.upload_state_path(&state.uuid)).await?;
-        remove_if_exists(self.upload_content_path(&state.uuid)).await?;
+        self.store_content_object(&content).await?;
+        self.metadata
+            .delete_oci_upload(repository, &state.uuid)
+            .await?;
         Ok(OciBlob {
             content,
             digest: digest.to_string(),
@@ -179,20 +113,7 @@ impl OciRegistry {
             )));
         }
         let _guard = self.write_lock.lock().await;
-        let blob_path = self.blob_path(digest)?;
-        if let Some(parent) = blob_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                AppError::Internal(format!("failed to create OCI blob storage: {error}"))
-            })?;
-        }
-        tokio::fs::write(&blob_path, &content)
-            .await
-            .map_err(|error| {
-                AppError::Internal(format!(
-                    "failed to write OCI blob '{}': {error}",
-                    blob_path.display()
-                ))
-            })?;
+        self.store_content_object(&content).await?;
         Ok(OciBlob {
             content: content.to_vec(),
             digest: digest.to_string(),
@@ -202,17 +123,17 @@ impl OciRegistry {
     pub async fn read_blob(&self, repository: &str, digest: &str) -> Result<OciBlob, AppError> {
         validate_repository_name(repository)?;
         validate_digest(digest)?;
-        let path = self.blob_path(digest)?;
-        let content = tokio::fs::read(&path).await.map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                AppError::NotFound(format!("unknown OCI blob '{digest}'"))
-            } else {
-                AppError::Internal(format!(
-                    "failed to read OCI blob '{}': {error}",
-                    path.display()
-                ))
-            }
-        })?;
+        let content = self
+            .objects
+            .read(&digest_sha256_bytes(digest)?)
+            .await
+            .map_err(|error| {
+                if matches!(error, AppError::NotFound(_)) {
+                    AppError::NotFound(format!("unknown OCI blob '{digest}'"))
+                } else {
+                    error
+                }
+            })?;
         Ok(OciBlob {
             content,
             digest: digest.to_string(),
@@ -240,44 +161,23 @@ impl OciRegistry {
             media_type
         };
         let _guard = self.write_lock.lock().await;
-        let manifest_path = self.manifest_path(repository, &digest)?;
-        if let Some(parent) = manifest_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                AppError::Internal(format!("failed to create OCI manifest storage: {error}"))
-            })?;
-        }
-        tokio::fs::write(&manifest_path, &content)
-            .await
-            .map_err(|error| {
-                AppError::Internal(format!(
-                    "failed to write OCI manifest '{}': {error}",
-                    manifest_path.display()
-                ))
-            })?;
-        let media_type_path = self.manifest_media_type_path(repository, &digest)?;
-        if let Some(parent) = media_type_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                AppError::Internal(format!(
-                    "failed to create OCI manifest media type storage: {error}"
-                ))
-            })?;
-        }
-        tokio::fs::write(media_type_path, media_type)
-            .await
-            .map_err(|error| {
-                AppError::Internal(format!("failed to write OCI manifest media type: {error}"))
-            })?;
+        self.store_content_object(&content).await?;
+        self.metadata
+            .store_oci_manifest(OciManifestRecord {
+                repository: repository.to_string(),
+                digest: digest.clone(),
+                media_type: media_type.to_string(),
+            })
+            .await?;
 
         if !is_digest(reference) {
-            let tag_path = self.tag_path(repository, reference)?;
-            if let Some(parent) = tag_path.parent() {
-                tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                    AppError::Internal(format!("failed to create OCI tag storage: {error}"))
-                })?;
-            }
-            tokio::fs::write(tag_path, &digest)
-                .await
-                .map_err(|error| AppError::Internal(format!("failed to write OCI tag: {error}")))?;
+            self.metadata
+                .store_oci_tag(OciTagRecord {
+                    repository: repository.to_string(),
+                    tag: reference.to_string(),
+                    digest: digest.clone(),
+                })
+                .await?;
         }
 
         Ok(OciManifest {
@@ -297,40 +197,25 @@ impl OciRegistry {
         let digest = if is_digest(reference) {
             reference.to_string()
         } else {
-            let tag_path = self.tag_path(repository, reference)?;
-            tokio::fs::read_to_string(&tag_path)
-                .await
-                .map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::NotFound {
-                        AppError::NotFound(format!("unknown OCI tag '{repository}:{reference}'"))
-                    } else {
-                        AppError::Internal(format!(
-                            "failed to read OCI tag '{}': {error}",
-                            tag_path.display()
-                        ))
-                    }
-                })?
+            self.metadata.oci_tag(repository, reference).await?.digest
         };
         validate_digest(&digest)?;
-        let path = self.manifest_path(repository, &digest)?;
-        let content = tokio::fs::read(&path).await.map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                AppError::NotFound(format!("unknown OCI manifest '{repository}@{digest}'"))
-            } else {
-                AppError::Internal(format!(
-                    "failed to read OCI manifest '{}': {error}",
-                    path.display()
-                ))
-            }
-        })?;
-        let media_type =
-            tokio::fs::read_to_string(self.manifest_media_type_path(repository, &digest)?)
-                .await
-                .unwrap_or_else(|_| "application/vnd.oci.image.manifest.v1+json".to_string());
+        let manifest = self.metadata.oci_manifest(repository, &digest).await?;
+        let content = self
+            .objects
+            .read(&digest_sha256_bytes(&digest)?)
+            .await
+            .map_err(|error| {
+                if matches!(error, AppError::NotFound(_)) {
+                    AppError::NotFound(format!("unknown OCI manifest '{repository}@{digest}'"))
+                } else {
+                    error
+                }
+            })?;
         Ok(OciManifest {
             content,
             digest,
-            media_type,
+            media_type: manifest.media_type,
         })
     }
 
@@ -338,82 +223,19 @@ impl OciRegistry {
         &self,
         repository: &str,
         uuid: &str,
-    ) -> Result<UploadState, AppError> {
+    ) -> Result<OciUploadState, AppError> {
         validate_repository_name(repository)?;
         validate_uuid(uuid)?;
-        let path = self.upload_state_path(uuid);
-        let content = tokio::fs::read_to_string(&path).await.map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                AppError::NotFound(format!("unknown OCI upload '{uuid}'"))
-            } else {
-                AppError::Internal(format!(
-                    "failed to read OCI upload state '{}': {error}",
-                    path.display()
-                ))
-            }
-        })?;
-        let state: UploadState = serde_json::from_str(&content).map_err(|error| {
-            AppError::Internal(format!("failed to parse OCI upload state: {error}"))
-        })?;
-        if state.repository != repository {
-            return Err(AppError::NotFound(format!("unknown OCI upload '{uuid}'")));
+        self.metadata.oci_upload(repository, uuid).await
+    }
+
+    async fn store_content_object(&self, content: &[u8]) -> Result<[u8; 32], AppError> {
+        let mut writer = self.objects.create_writer().await?;
+        if let Err(error) = writer.write_chunk(content).await {
+            writer.abort().await?;
+            return Err(error);
         }
-        Ok(state)
-    }
-
-    fn uploads_dir(&self) -> PathBuf {
-        self.root.join("oci").join("uploads")
-    }
-
-    fn upload_state_path(&self, uuid: &str) -> PathBuf {
-        self.uploads_dir().join(format!("{uuid}.json"))
-    }
-
-    fn upload_content_path(&self, uuid: &str) -> PathBuf {
-        self.uploads_dir().join(format!("{uuid}.bin"))
-    }
-
-    fn blobs_dir(&self) -> PathBuf {
-        self.root.join("oci").join("blobs")
-    }
-
-    fn blob_path(&self, digest: &str) -> Result<PathBuf, AppError> {
-        let (_algorithm, encoded) = split_digest(digest)?;
-        Ok(self.blobs_dir().join("sha256").join(encoded))
-    }
-
-    fn repository_dir(&self, repository: &str) -> Result<PathBuf, AppError> {
-        validate_repository_name(repository)?;
-        Ok(self
-            .root
-            .join("oci")
-            .join("repositories")
-            .join(repository.replace('/', "__")))
-    }
-
-    fn manifest_path(&self, repository: &str, digest: &str) -> Result<PathBuf, AppError> {
-        let (_algorithm, encoded) = split_digest(digest)?;
-        Ok(self
-            .repository_dir(repository)?
-            .join("manifests")
-            .join(encoded))
-    }
-
-    fn manifest_media_type_path(
-        &self,
-        repository: &str,
-        digest: &str,
-    ) -> Result<PathBuf, AppError> {
-        let (_algorithm, encoded) = split_digest(digest)?;
-        Ok(self
-            .repository_dir(repository)?
-            .join("manifest-media-types")
-            .join(encoded))
-    }
-
-    fn tag_path(&self, repository: &str, tag: &str) -> Result<PathBuf, AppError> {
-        validate_tag(tag)?;
-        Ok(self.repository_dir(repository)?.join("tags").join(tag))
+        writer.commit().await
     }
 }
 
@@ -505,12 +327,6 @@ fn sha256_digest(content: &[u8]) -> String {
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
-fn serialize_state(state: &UploadState) -> Result<Vec<u8>, AppError> {
-    serde_json::to_vec(state).map_err(|error| {
-        AppError::Internal(format!("failed to serialize OCI upload state: {error}"))
-    })
-}
-
 fn uuid_v4() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -562,29 +378,25 @@ fn validate_uuid(uuid: &str) -> Result<(), AppError> {
     }
 }
 
-async fn path_exists(path: &Path) -> Result<bool, AppError> {
-    tokio::fs::try_exists(path).await.map_err(|error| {
+fn digest_sha256_bytes(digest: &str) -> Result<[u8; 32], AppError> {
+    let (_algorithm, encoded) = split_digest(digest)?;
+    let bytes = hex::decode(encoded).map_err(|error| {
+        AppError::Internal(format!("failed to decode OCI digest '{digest}': {error}"))
+    })?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
         AppError::Internal(format!(
-            "failed to check path '{}': {error}",
-            path.display()
+            "invalid OCI digest '{digest}': expected 32 bytes, got {}",
+            bytes.len()
         ))
     })
-}
-
-async fn remove_if_exists(path: PathBuf) -> Result<(), AppError> {
-    match tokio::fs::remove_file(&path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(AppError::Internal(format!(
-            "failed to remove '{}': {error}",
-            path.display()
-        ))),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{OciRegistry, is_valid_repository_name};
+    use crate::metadata::{FilesystemMetadataStore, SurrealMetadataStore};
+    use crate::object_store::FilesystemObjectStore;
+    use std::sync::Arc;
 
     #[test]
     fn validates_repository_names() {
@@ -598,7 +410,9 @@ mod tests {
     #[tokio::test]
     async fn stores_blob_and_manifest() {
         let tempdir = tempfile::tempdir().unwrap();
-        let registry = OciRegistry::new(tempdir.path());
+        let metadata = Arc::new(SurrealMetadataStore::in_memory().await.unwrap());
+        let objects = Arc::new(FilesystemObjectStore::new(tempdir.path().join("objects")));
+        let registry = OciRegistry::new(metadata, objects);
         let blob = registry
             .store_blob(
                 "team/image",
@@ -624,5 +438,41 @@ mod tests {
             .unwrap();
         assert_eq!(read.digest, manifest.digest);
         assert_eq!(read.content, b"{}");
+    }
+
+    #[tokio::test]
+    async fn filesystem_metadata_persists_manifest_references() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let metadata = Arc::new(FilesystemMetadataStore::new(
+            tempdir.path().join("metadata"),
+        ));
+        let objects = Arc::new(FilesystemObjectStore::new(tempdir.path().join("objects")));
+        let registry = OciRegistry::new(metadata, objects.clone());
+
+        let manifest = registry
+            .store_manifest(
+                "team/image",
+                "latest",
+                "application/vnd.oci.image.manifest.v1+json",
+                "{}".into(),
+            )
+            .await
+            .unwrap();
+
+        let reopened_metadata = Arc::new(FilesystemMetadataStore::new(
+            tempdir.path().join("metadata"),
+        ));
+        let reopened = OciRegistry::new(reopened_metadata, objects);
+        let read = reopened
+            .read_manifest("team/image", "latest")
+            .await
+            .unwrap();
+
+        assert_eq!(read.digest, manifest.digest);
+        assert_eq!(read.content, b"{}");
+        assert_eq!(
+            read.media_type,
+            "application/vnd.oci.image.manifest.v1+json"
+        );
     }
 }

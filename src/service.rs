@@ -42,11 +42,11 @@ pub struct AppState {
 }
 
 pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Result<AppState> {
-    let object_directory = config.object_store.directory_or_default();
+    let repository =
+        PackageRepository::from_config(&config.metadata_store, &config.object_store).await?;
     Ok(AppState {
-        repository: PackageRepository::from_config(&config.metadata_store, &config.object_store)
-            .await?,
-        oci_registry: OciRegistry::new(object_directory),
+        oci_registry: OciRegistry::new(repository.metadata_store(), repository.object_store()),
+        repository,
         subject_validator: SubjectValidator::new(config.identity_providers.clone(), disable_auth),
         publishers: Arc::new(config.publishers.clone()),
         max_upload_bytes: config.max_upload_bytes,
@@ -1580,9 +1580,10 @@ mod tests {
     }
 
     async fn unauthenticated_state(path: &std::path::Path) -> AppState {
+        let repository = PackageRepository::new(path).await.unwrap();
         AppState {
-            repository: PackageRepository::new(path).await.unwrap(),
-            oci_registry: OciRegistry::new(path),
+            oci_registry: OciRegistry::new(repository.metadata_store(), repository.object_store()),
+            repository,
             subject_validator: SubjectValidator::new(Vec::new(), true),
             publishers: Arc::new(Vec::new()),
             max_upload_bytes: 1024 * 1024,
@@ -1592,9 +1593,10 @@ mod tests {
     }
 
     async fn authenticated_state(path: &std::path::Path) -> AppState {
+        let repository = PackageRepository::new(path).await.unwrap();
         AppState {
-            repository: PackageRepository::new(path).await.unwrap(),
-            oci_registry: OciRegistry::new(path),
+            oci_registry: OciRegistry::new(repository.metadata_store(), repository.object_store()),
+            repository,
             subject_validator: SubjectValidator::new(
                 vec![IdentityProviderConfig {
                     name: "buildkite".to_string(),

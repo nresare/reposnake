@@ -15,6 +15,7 @@ use std::path::PathBuf;
 pub struct Config {
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
+    pub origin: String,
     #[serde(default = "default_max_upload_bytes")]
     pub max_upload_bytes: usize,
     #[serde(default)]
@@ -110,6 +111,9 @@ impl Config {
     pub fn validate(&self, disable_auth: bool) -> anyhow::Result<()> {
         if self.bind_address.is_empty() {
             anyhow::bail!("bind-address must not be empty");
+        }
+        if self.origin.is_empty() {
+            anyhow::bail!("origin must not be empty");
         }
         if self.max_upload_bytes == 0 {
             anyhow::bail!("max-upload-bytes must be greater than 0");
@@ -384,6 +388,8 @@ mod tests {
     fn parses_minimal_authenticated_config() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [[identity-provider]]
 name = "buildkite"
 audience = "reposnake"
@@ -403,6 +409,7 @@ sub = "buildkite:deploy"
 
         config.validate(false).unwrap();
         assert_eq!(config.bind_address, "0.0.0.0:8080");
+        assert_eq!(config.origin, "http://localhost:8080");
         assert_eq!(config.max_upload_bytes, 100 * 1024 * 1024);
         assert_eq!(config.metadata_store.uri, "mem://");
         assert_eq!(config.identity_providers[0].name, "buildkite");
@@ -414,9 +421,37 @@ sub = "buildkite:deploy"
     }
 
     #[test]
+    fn parses_origin_config() {
+        let config: Config = toml::from_str(
+            r#"
+origin = "https://packages.example"
+
+[[publisher]]
+projects = ["*"]
+"#,
+        )
+        .unwrap();
+
+        config.validate(true).unwrap();
+        assert_eq!(config.origin, "https://packages.example");
+    }
+
+    #[test]
+    fn rejects_missing_origin_config() {
+        let config = r#"
+[[publisher]]
+projects = ["*"]
+"#;
+
+        assert!(toml::from_str::<Config>(config).is_err());
+    }
+
+    #[test]
     fn parses_filesystem_object_store_directory() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [object-store]
 directory = "/tmp/reposnake"
 
@@ -438,6 +473,8 @@ projects = ["*"]
     fn parses_s3_object_store_config() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [object-store]
 backend = "s3"
 bucket = "reposnake-packages"
@@ -541,6 +578,8 @@ repository_owner = "example"
     fn rejects_s3_object_store_without_bucket() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [object-store]
 backend = "s3"
 
@@ -557,6 +596,8 @@ projects = ["*"]
     fn accepts_s3_object_store_without_directory() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [object-store]
 backend = "s3"
 bucket = "reposnake-packages"
@@ -575,6 +616,8 @@ projects = ["*"]
     fn rejects_filesystem_object_store_without_directory() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [object-store]
 backend = "filesystem"
 
@@ -604,6 +647,8 @@ bucket = "reposnake-packages"
     fn parses_metadata_store_config() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [metadata-store]
 uri = "ws://localhost:8000/"
 username = "reposnake"
@@ -624,6 +669,8 @@ projects = ["*"]
     fn parses_filesystem_metadata_store_config() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [metadata-store]
 backend = "filesystem"
 directory = "/data/metadata"
@@ -649,6 +696,8 @@ projects = ["*"]
     fn rejects_filesystem_metadata_store_without_directory() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [metadata-store]
 backend = "filesystem"
 
@@ -669,6 +718,8 @@ projects = ["*"]
     fn rejects_metadata_store_directory_without_filesystem_backend() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [metadata-store]
 directory = "/data/metadata"
 
@@ -689,6 +740,8 @@ projects = ["*"]
     fn rejects_surrealdb_auth_for_filesystem_metadata_store() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [metadata-store]
 backend = "filesystem"
 directory = "/data/metadata"
@@ -712,6 +765,8 @@ projects = ["*"]
     fn parses_idmouse_metadata_store_config() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [metadata-store]
 uri = "ws://localhost:8000/"
 
@@ -738,6 +793,8 @@ projects = ["*"]
     fn rejects_password_auth_when_idmouse_is_configured() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [metadata-store]
 uri = "ws://localhost:8000/"
 username = "reposnake"
@@ -766,6 +823,8 @@ projects = ["*"]
         writeln!(password_file, "secret").unwrap();
         let config: Config = toml::from_str(&format!(
             r#"
+origin = "http://localhost:8080"
+
 [metadata-store]
 uri = "ws://localhost:8000/"
 username = "reposnake"
@@ -788,6 +847,8 @@ projects = ["*"]
     fn disable_auth_skips_authentication_and_required_claims_validation() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [[publisher]]
 projects = ["*"]
 "#,
@@ -801,6 +862,8 @@ projects = ["*"]
     fn rejects_missing_identity_provider_when_auth_is_enabled() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [[publisher]]
 projects = ["*"]
 
@@ -821,6 +884,8 @@ sub = "buildkite:deploy"
     fn rejects_missing_publisher_policy_when_auth_is_enabled() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [[identity-provider]]
 name = "buildkite"
 audience = "reposnake"
@@ -840,6 +905,8 @@ issuer = "https://issuer.example"
     fn validation_key_is_optional_when_auth_is_enabled() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [[identity-provider]]
 name = "buildkite"
 audience = "reposnake"
@@ -862,6 +929,8 @@ sub = "buildkite:deploy"
     fn required_claim_keys_are_not_renamed() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [[publisher]]
 projects = ["*"]
 
@@ -884,6 +953,8 @@ repository_owner = "example"
     fn rejects_publisher_with_unknown_identity_provider() {
         let config: Config = toml::from_str(
             r#"
+origin = "http://localhost:8080"
+
 [[identity-provider]]
 name = "kubernetes"
 audience = "reposnake"

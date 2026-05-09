@@ -27,6 +27,18 @@ pub trait MetadataStore: fmt::Debug + Send + Sync {
     async fn list_projects(&self) -> Result<Vec<ProjectSummary>, AppError>;
     async fn project(&self, normalized_project: &str) -> Result<ProjectIndex, AppError>;
     async fn add_file(&self, project: ProjectSummary, file: FileRecord) -> Result<(), AppError>;
+    async fn create_oci_upload(&self, state: OciUploadState) -> Result<(), AppError>;
+    async fn oci_upload(&self, repository: &str, uuid: &str) -> Result<OciUploadState, AppError>;
+    async fn update_oci_upload(&self, state: OciUploadState) -> Result<(), AppError>;
+    async fn delete_oci_upload(&self, repository: &str, uuid: &str) -> Result<(), AppError>;
+    async fn store_oci_manifest(&self, manifest: OciManifestRecord) -> Result<(), AppError>;
+    async fn oci_manifest(
+        &self,
+        repository: &str,
+        digest: &str,
+    ) -> Result<OciManifestRecord, AppError>;
+    async fn store_oci_tag(&self, tag: OciTagRecord) -> Result<(), AppError>;
+    async fn oci_tag(&self, repository: &str, tag: &str) -> Result<OciTagRecord, AppError>;
 }
 
 pub async fn build_metadata_store(
@@ -71,6 +83,31 @@ struct FileDoc {
     sha256: String,
     size: u64,
     requires_python: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[surreal(crate = "surrealdb::types")]
+pub struct OciUploadState {
+    pub repository: String,
+    pub uuid: String,
+    pub size: u64,
+    pub content: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[surreal(crate = "surrealdb::types")]
+pub struct OciManifestRecord {
+    pub repository: String,
+    pub digest: String,
+    pub media_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[surreal(crate = "surrealdb::types")]
+pub struct OciTagRecord {
+    pub repository: String,
+    pub tag: String,
+    pub digest: String,
 }
 
 impl SurrealMetadataStore {
@@ -196,6 +233,78 @@ impl FilesystemMetadataStore {
             })?;
         Ok(())
     }
+
+    async fn read_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &std::path::Path,
+        kind: &str,
+    ) -> Result<T, AppError> {
+        let content = tokio::fs::read(path).await.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("unknown {kind}"))
+            } else {
+                AppError::Internal(format!(
+                    "failed to read {kind} '{}': {error}",
+                    path.display()
+                ))
+            }
+        })?;
+        serde_json::from_slice(&content).map_err(|error| {
+            AppError::Internal(format!(
+                "failed to decode {kind} '{}': {error}",
+                path.display()
+            ))
+        })
+    }
+
+    async fn write_json<T: Serialize>(
+        &self,
+        path: &std::path::Path,
+        value: &T,
+    ) -> Result<(), AppError> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| AppError::Internal("metadata path has no parent".to_string()))?;
+        tokio::fs::create_dir_all(parent).await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to create metadata directory '{}': {error}",
+                parent.display()
+            ))
+        })?;
+        let content = serde_json::to_vec_pretty(value)
+            .map_err(|error| AppError::Internal(format!("failed to encode metadata: {error}")))?;
+        tokio::fs::write(path, content).await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to write metadata '{}': {error}",
+                path.display()
+            ))
+        })
+    }
+
+    fn oci_upload_path(&self, uuid: &str) -> PathBuf {
+        self.directory
+            .join("oci")
+            .join("uploads")
+            .join(format!("{uuid}.json"))
+    }
+
+    fn oci_manifest_path(&self, repository: &str, digest: &str) -> PathBuf {
+        self.directory
+            .join("oci")
+            .join("repositories")
+            .join(encode_oci_key(repository))
+            .join("manifests")
+            .join(format!("{}.json", encode_oci_key(digest)))
+    }
+
+    fn oci_tag_path(&self, repository: &str, tag: &str) -> PathBuf {
+        self.directory
+            .join("oci")
+            .join("repositories")
+            .join(encode_oci_key(repository))
+            .join("tags")
+            .join(format!("{}.json", encode_oci_key(tag)))
+    }
 }
 
 pub async fn make_db(config: &MetadataStoreConfig) -> anyhow::Result<Arc<Surreal<Any>>> {
@@ -236,8 +345,15 @@ async fn setup_db(db: &Surreal<Any>) -> anyhow::Result<()> {
     db.query(
         "DEFINE TABLE IF NOT EXISTS project; \
          DEFINE TABLE IF NOT EXISTS package_file; \
+         DEFINE TABLE IF NOT EXISTS oci_upload; \
+         DEFINE TABLE IF NOT EXISTS oci_manifest; \
+         DEFINE TABLE IF NOT EXISTS oci_tag; \
          DEFINE INDEX IF NOT EXISTS packageFileByProjectFilename \
-         ON package_file FIELDS normalized_project, filename UNIQUE;",
+         ON package_file FIELDS normalized_project, filename UNIQUE; \
+         DEFINE INDEX IF NOT EXISTS ociManifestByRepositoryDigest \
+         ON oci_manifest FIELDS repository, digest UNIQUE; \
+         DEFINE INDEX IF NOT EXISTS ociTagByRepositoryTag \
+         ON oci_tag FIELDS repository, tag UNIQUE;",
     )
     .await?;
     Ok(())
@@ -360,6 +476,97 @@ impl MetadataStore for SurrealMetadataStore {
             })?;
         Ok(())
     }
+
+    async fn create_oci_upload(&self, state: OciUploadState) -> Result<(), AppError> {
+        let _upload: Option<OciUploadState> = self
+            .db
+            .create(("oci_upload", state.uuid.as_str()))
+            .content(state)
+            .await
+            .map_err(|error| AppError::Internal(format!("failed to store OCI upload: {error}")))?;
+        Ok(())
+    }
+
+    async fn oci_upload(&self, repository: &str, uuid: &str) -> Result<OciUploadState, AppError> {
+        let state: Option<OciUploadState> = self
+            .db
+            .select(("oci_upload", uuid))
+            .await
+            .map_err(|error| AppError::Internal(format!("failed to read OCI upload: {error}")))?;
+        let state =
+            state.ok_or_else(|| AppError::NotFound(format!("unknown OCI upload '{uuid}'")))?;
+        if state.repository != repository {
+            return Err(AppError::NotFound(format!("unknown OCI upload '{uuid}'")));
+        }
+        Ok(state)
+    }
+
+    async fn update_oci_upload(&self, state: OciUploadState) -> Result<(), AppError> {
+        let _upload: Option<OciUploadState> = self
+            .db
+            .upsert(("oci_upload", state.uuid.as_str()))
+            .content(state)
+            .await
+            .map_err(|error| AppError::Internal(format!("failed to update OCI upload: {error}")))?;
+        Ok(())
+    }
+
+    async fn delete_oci_upload(&self, repository: &str, uuid: &str) -> Result<(), AppError> {
+        self.oci_upload(repository, uuid).await?;
+        let _deleted: Option<OciUploadState> = self
+            .db
+            .delete(("oci_upload", uuid))
+            .await
+            .map_err(|error| AppError::Internal(format!("failed to delete OCI upload: {error}")))?;
+        Ok(())
+    }
+
+    async fn store_oci_manifest(&self, manifest: OciManifestRecord) -> Result<(), AppError> {
+        let _manifest: Option<OciManifestRecord> = self
+            .db
+            .upsert((
+                "oci_manifest",
+                oci_manifest_id(&manifest.repository, &manifest.digest),
+            ))
+            .content(manifest)
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!("failed to store OCI manifest: {error}"))
+            })?;
+        Ok(())
+    }
+
+    async fn oci_manifest(
+        &self,
+        repository: &str,
+        digest: &str,
+    ) -> Result<OciManifestRecord, AppError> {
+        self.db
+            .select(("oci_manifest", oci_manifest_id(repository, digest)))
+            .await
+            .map_err(|error| AppError::Internal(format!("failed to read OCI manifest: {error}")))?
+            .ok_or_else(|| {
+                AppError::NotFound(format!("unknown OCI manifest '{repository}@{digest}'"))
+            })
+    }
+
+    async fn store_oci_tag(&self, tag: OciTagRecord) -> Result<(), AppError> {
+        let _tag: Option<OciTagRecord> = self
+            .db
+            .upsert(("oci_tag", oci_tag_id(&tag.repository, &tag.tag)))
+            .content(tag)
+            .await
+            .map_err(|error| AppError::Internal(format!("failed to store OCI tag: {error}")))?;
+        Ok(())
+    }
+
+    async fn oci_tag(&self, repository: &str, tag: &str) -> Result<OciTagRecord, AppError> {
+        self.db
+            .select(("oci_tag", oci_tag_id(repository, tag)))
+            .await
+            .map_err(|error| AppError::Internal(format!("failed to read OCI tag: {error}")))?
+            .ok_or_else(|| AppError::NotFound(format!("unknown OCI tag '{repository}:{tag}'")))
+    }
 }
 
 #[async_trait]
@@ -452,10 +659,106 @@ impl MetadataStore for FilesystemMetadataStore {
             .sort_by(|left, right| left.filename.cmp(&right.filename));
         self.write_project(&index).await
     }
+
+    async fn create_oci_upload(&self, state: OciUploadState) -> Result<(), AppError> {
+        self.write_json(&self.oci_upload_path(&state.uuid), &state)
+            .await
+    }
+
+    async fn oci_upload(&self, repository: &str, uuid: &str) -> Result<OciUploadState, AppError> {
+        let state: OciUploadState = self
+            .read_json(&self.oci_upload_path(uuid), "OCI upload")
+            .await
+            .map_err(|error| {
+                if matches!(error, AppError::NotFound(_)) {
+                    AppError::NotFound(format!("unknown OCI upload '{uuid}'"))
+                } else {
+                    error
+                }
+            })?;
+        if state.repository != repository {
+            return Err(AppError::NotFound(format!("unknown OCI upload '{uuid}'")));
+        }
+        Ok(state)
+    }
+
+    async fn update_oci_upload(&self, state: OciUploadState) -> Result<(), AppError> {
+        self.write_json(&self.oci_upload_path(&state.uuid), &state)
+            .await
+    }
+
+    async fn delete_oci_upload(&self, repository: &str, uuid: &str) -> Result<(), AppError> {
+        self.oci_upload(repository, uuid).await?;
+        remove_file_if_exists(self.oci_upload_path(uuid)).await
+    }
+
+    async fn store_oci_manifest(&self, manifest: OciManifestRecord) -> Result<(), AppError> {
+        self.write_json(
+            &self.oci_manifest_path(&manifest.repository, &manifest.digest),
+            &manifest,
+        )
+        .await
+    }
+
+    async fn oci_manifest(
+        &self,
+        repository: &str,
+        digest: &str,
+    ) -> Result<OciManifestRecord, AppError> {
+        self.read_json(&self.oci_manifest_path(repository, digest), "OCI manifest")
+            .await
+            .map_err(|error| {
+                if matches!(error, AppError::NotFound(_)) {
+                    AppError::NotFound(format!("unknown OCI manifest '{repository}@{digest}'"))
+                } else {
+                    error
+                }
+            })
+    }
+
+    async fn store_oci_tag(&self, tag: OciTagRecord) -> Result<(), AppError> {
+        self.write_json(&self.oci_tag_path(&tag.repository, &tag.tag), &tag)
+            .await
+    }
+
+    async fn oci_tag(&self, repository: &str, tag: &str) -> Result<OciTagRecord, AppError> {
+        self.read_json(&self.oci_tag_path(repository, tag), "OCI tag")
+            .await
+            .map_err(|error| {
+                if matches!(error, AppError::NotFound(_)) {
+                    AppError::NotFound(format!("unknown OCI tag '{repository}:{tag}'"))
+                } else {
+                    error
+                }
+            })
+    }
 }
 
 fn file_id(normalized_project: &str, filename: &str) -> String {
     format!("{normalized_project}/{filename}")
+}
+
+fn oci_manifest_id(repository: &str, digest: &str) -> String {
+    format!("{}/{}", encode_oci_key(repository), encode_oci_key(digest))
+}
+
+fn oci_tag_id(repository: &str, tag: &str) -> String {
+    format!("{}/{}", encode_oci_key(repository), encode_oci_key(tag))
+}
+
+fn encode_oci_key(value: &str) -> String {
+    value.replace('/', "__").replace(':', "_")
+}
+
+async fn remove_file_if_exists(path: PathBuf) -> Result<(), AppError> {
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AppError::Internal(format!(
+            "failed to remove metadata '{}': {error}",
+            path.display()
+        ))),
+    }
 }
 
 #[cfg(test)]

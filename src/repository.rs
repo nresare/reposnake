@@ -66,6 +66,14 @@ impl PackageRepository {
         }
     }
 
+    pub fn metadata_store(&self) -> SharedMetadataStore {
+        self.metadata.clone()
+    }
+
+    pub fn object_store(&self) -> SharedObjectStore {
+        self.objects.clone()
+    }
+
     pub async fn list_projects(&self) -> Result<Vec<ProjectSummary>, AppError> {
         self.metadata.list_projects().await
     }

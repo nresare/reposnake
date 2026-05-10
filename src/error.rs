@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: The reposnake contributors
 
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use tracing::{error, warn};
@@ -21,6 +21,11 @@ pub enum AppError {
     PayloadTooLarge(String),
     #[error("{0}")]
     Unauthorized(String),
+    #[error("{message}")]
+    OciUnauthorized {
+        message: String,
+        authenticate: String,
+    },
     #[error("{0}")]
     Internal(String),
 }
@@ -39,7 +44,9 @@ impl IntoResponse for AppError {
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
             AppError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
-            AppError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            AppError::Unauthorized(_) | AppError::OciUnauthorized { .. } => {
+                StatusCode::UNAUTHORIZED
+            }
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         match &self {
@@ -51,11 +58,28 @@ impl IntoResponse for AppError {
             | AppError::Forbidden(_)
             | AppError::NotFound(_)
             | AppError::PayloadTooLarge(_)
-            | AppError::Unauthorized(_) => {
+            | AppError::Unauthorized(_)
+            | AppError::OciUnauthorized { .. } => {
                 warn!(status = status.as_u16(), error = %message, "request rejected");
             }
         }
-        (status, Json(ErrorBody { error: &message })).into_response()
+        let mut response = (status, Json(ErrorBody { error: &message })).into_response();
+        if let AppError::OciUnauthorized { authenticate, .. } = self {
+            match authenticate.parse() {
+                Ok(value) => {
+                    response
+                        .headers_mut()
+                        .insert(header::WWW_AUTHENTICATE, value);
+                }
+                Err(error) => {
+                    error!(
+                        error = %error,
+                        "failed to build OCI WWW-Authenticate header"
+                    );
+                }
+            }
+        }
+        response
     }
 }
 

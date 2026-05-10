@@ -68,6 +68,7 @@ pub fn build_router(state: AppState) -> Router {
             "/v2/",
             get(oci_api_version_check).head(oci_api_version_check),
         )
+        .route("/v2/token", get(oci_token))
         .route(
             "/v2/{*path}",
             get(oci_dispatch)
@@ -130,7 +131,7 @@ async fn oci_dispatch(
     if let Some((repository, upload_uuid)) = split_oci_upload_path(&path) {
         return match method {
             Method::PATCH => {
-                let claims = authenticate_push(&state, &headers)?;
+                let claims = authenticate_oci_push(&state, &headers, repository)?;
                 state.authorize_oci_repository(repository, &claims)?;
                 let upload = state
                     .oci_registry
@@ -142,7 +143,7 @@ async fn oci_dispatch(
                 let digest = query.get("digest").ok_or_else(|| {
                     AppError::BadRequest("missing digest query parameter".to_string())
                 })?;
-                let claims = authenticate_push(&state, &headers)?;
+                let claims = authenticate_oci_push(&state, &headers, repository)?;
                 state.authorize_oci_repository(repository, &claims)?;
                 let blob = state
                     .oci_registry
@@ -160,7 +161,7 @@ async fn oci_dispatch(
     if let Some(repository) = split_oci_upload_start_path(&path) {
         return match method {
             Method::POST => {
-                let claims = authenticate_push(&state, &headers)?;
+                let claims = authenticate_oci_push(&state, &headers, repository)?;
                 state.authorize_oci_repository(repository, &claims)?;
                 if let Some(digest) = query.get("digest") {
                     let blob = state
@@ -193,7 +194,7 @@ async fn oci_dispatch(
             Method::GET => oci_get_manifest(&state, repository, reference, false).await,
             Method::HEAD => oci_get_manifest(&state, repository, reference, true).await,
             Method::PUT => {
-                let claims = authenticate_push(&state, &headers)?;
+                let claims = authenticate_oci_push(&state, &headers, repository)?;
                 state.authorize_oci_repository(repository, &claims)?;
                 let content_type = headers
                     .get(header::CONTENT_TYPE)
@@ -215,6 +216,33 @@ async fn oci_dispatch(
     Err(AppError::NotFound(format!(
         "unknown OCI registry path '/v2/{path}'"
     )))
+}
+
+async fn oci_token(
+    State(state): State<AppState>,
+    Query(request): Query<OciTokenRequest>,
+    headers: HeaderMap,
+) -> Result<Json<OciTokenResponse>, AppError> {
+    let token = auth::extract_upload_token(&headers)?;
+    let claims = state.subject_validator.validate(Some(&token))?;
+    if let Some(scope) = request.scope.as_deref() {
+        authorize_oci_token_scope(&state, &claims, scope)?;
+    }
+    Ok(Json(OciTokenResponse {
+        token: token.clone(),
+        access_token: token,
+    }))
+}
+
+#[derive(Deserialize)]
+struct OciTokenRequest {
+    scope: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OciTokenResponse {
+    token: String,
+    access_token: String,
 }
 
 async fn simple_project_redirect(Path(project): Path<String>) -> Redirect {
@@ -371,6 +399,20 @@ fn method_not_allowed() -> Result<Response, AppError> {
         })
 }
 
+fn authenticate_oci_push(
+    state: &AppState,
+    headers: &HeaderMap,
+    repository: &str,
+) -> Result<SourceClaims, AppError> {
+    authenticate_push(state, headers).map_err(|error| match error {
+        AppError::Unauthorized(message) => AppError::OciUnauthorized {
+            message,
+            authenticate: oci_authenticate_challenge(state, repository),
+        },
+        error => error,
+    })
+}
+
 fn authenticate_push(state: &AppState, headers: &HeaderMap) -> Result<SourceClaims, AppError> {
     let bearer_token = match auth::extract_upload_token(headers) {
         Ok(token) => Some(token),
@@ -378,6 +420,54 @@ fn authenticate_push(state: &AppState, headers: &HeaderMap) -> Result<SourceClai
         Err(error) => return Err(error),
     };
     state.subject_validator.validate(bearer_token.as_deref())
+}
+
+fn oci_authenticate_challenge(state: &AppState, repository: &str) -> String {
+    let realm = format!("{}/v2/token", state.origin.trim_end_matches('/'));
+    format!(
+        "Bearer realm=\"{}\",service=\"{}\",scope=\"repository:{}:pull,push\"",
+        quoted_header_value(&realm),
+        quoted_header_value(&oci_service_name(&state.origin)),
+        quoted_header_value(repository)
+    )
+}
+
+fn oci_service_name(origin: &str) -> String {
+    origin
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or(origin)
+        .to_string()
+}
+
+fn quoted_header_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn authorize_oci_token_scope(
+    state: &AppState,
+    claims: &SourceClaims,
+    scope: &str,
+) -> Result<(), AppError> {
+    let Some(repository_scope) = scope.strip_prefix("repository:") else {
+        return Ok(());
+    };
+    let Some((repository, actions)) = repository_scope.rsplit_once(':') else {
+        return Err(AppError::BadRequest(format!(
+            "invalid OCI token scope '{scope}'"
+        )));
+    };
+    if repository.is_empty() || actions.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "invalid OCI token scope '{scope}'"
+        )));
+    }
+    if actions.split(',').any(|action| action == "push") {
+        state.authorize_oci_repository(repository, claims)?;
+    }
+    Ok(())
 }
 
 fn split_oci_blob_path(path: &str) -> Option<(&str, &str)> {
@@ -1551,6 +1641,85 @@ mod tests {
         assert_eq!(response.headers()["Docker-Content-Digest"], manifest_digest);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], manifest.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn oci_push_without_credentials_returns_bearer_challenge() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = authenticated_state(tempdir.path()).await;
+        let app = build_router(state);
+        let layer_digest =
+            "sha256:dac1d7cfa95021764849fd102524e141488c5e3a90f861dbb5a12d9ac8584f85";
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v2/team/image/blobs/uploads/?digest={layer_digest}"
+                    ))
+                    .body(Body::from("layer"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let challenge = response.headers()[header::WWW_AUTHENTICATE]
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            challenge,
+            "Bearer realm=\"https://packages.example/v2/token\",service=\"packages.example\",scope=\"repository:team/image:pull,push\""
+        );
+    }
+
+    #[tokio::test]
+    async fn oci_token_endpoint_returns_validated_basic_password_token() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = authenticated_state(tempdir.path()).await;
+        let app = build_router(state);
+        let token = test_token("builder", "ci");
+        let credentials = general_purpose::STANDARD.encode(format!("__token__:{token}"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/token?service=packages.example&scope=repository:team/image:pull,push")
+                    .header(header::AUTHORIZATION, format!("Basic {credentials}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["token"], token);
+        assert_eq!(body["access_token"], token);
+    }
+
+    #[tokio::test]
+    async fn oci_token_endpoint_rejects_push_scope_with_wrong_claims() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = authenticated_state(tempdir.path()).await;
+        let app = build_router(state);
+        let token = test_token("builder", "other");
+        let credentials = general_purpose::STANDARD.encode(format!("__token__:{token}"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/token?scope=repository:team/image:pull,push")
+                    .header(header::AUTHORIZATION, format!("Basic {credentials}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

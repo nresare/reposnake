@@ -123,6 +123,9 @@ docker push localhost:8080/team/image:latest
 ```
 
 Direct clients may also use bearer authentication when creating blob uploads and writing manifests under `/v2/{repository}/...`.
+When a Docker-compatible client starts a push without credentials, reposnake returns a Bearer
+challenge pointing at `/v2/token`. The token endpoint validates the JWT supplied through Basic
+or Bearer authentication and returns that same JWT as the registry bearer token.
 
 For local testing, authentication and publisher policy checks can be bypassed:
 

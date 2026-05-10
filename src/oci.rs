@@ -222,6 +222,11 @@ impl OciRegistry {
         })
     }
 
+    pub async fn list_tags(&self, repository: &str) -> Result<Vec<String>, AppError> {
+        validate_repository_name(repository)?;
+        self.metadata.list_oci_tags(repository).await
+    }
+
     async fn read_upload_state(
         &self,
         repository: &str,

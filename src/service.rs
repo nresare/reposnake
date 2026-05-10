@@ -189,6 +189,13 @@ async fn oci_dispatch(
         };
     }
 
+    if let Some(repository) = split_oci_tags_path(&path) {
+        return match method {
+            Method::GET => oci_list_tags(&state, repository).await,
+            _ => method_not_allowed(),
+        };
+    }
+
     if let Some((repository, reference)) = split_oci_manifest_path(&path) {
         return match method {
             Method::GET => oci_get_manifest(&state, repository, reference, false).await,
@@ -243,6 +250,12 @@ struct OciTokenRequest {
 struct OciTokenResponse {
     token: String,
     access_token: String,
+}
+
+#[derive(Serialize)]
+struct OciTagsResponse {
+    name: String,
+    tags: Vec<String>,
 }
 
 async fn simple_project_redirect(Path(project): Path<String>) -> Redirect {
@@ -364,6 +377,25 @@ async fn oci_get_manifest(
         .map_err(|error| {
             AppError::Internal(format!("failed to build OCI manifest response: {error}"))
         })
+}
+
+async fn oci_list_tags(state: &AppState, repository: &str) -> Result<Response, AppError> {
+    let tags = state.oci_registry.list_tags(repository).await?;
+    let content = serde_json::to_vec(&OciTagsResponse {
+        name: repository.to_string(),
+        tags,
+    })
+    .map_err(|error| AppError::Internal(format!("failed to encode OCI tags: {error}")))?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_LENGTH, content.len().to_string())
+        .header(
+            "Docker-Distribution-API-Version",
+            DOCKER_DISTRIBUTION_API_VERSION,
+        )
+        .body(Body::from(content))
+        .map_err(|error| AppError::Internal(format!("failed to build OCI tags response: {error}")))
 }
 
 fn oci_upload_response(repository: &str, uuid: &str, size: u64) -> Result<Response, AppError> {
@@ -489,6 +521,11 @@ fn split_oci_upload_path(path: &str) -> Option<(&str, &str)> {
 fn split_oci_upload_start_path(path: &str) -> Option<&str> {
     path.strip_suffix("/blobs/uploads/")
         .or_else(|| path.strip_suffix("/blobs/uploads"))
+        .filter(|repository| !repository.is_empty())
+}
+
+fn split_oci_tags_path(path: &str) -> Option<&str> {
+    path.strip_suffix("/tags/list")
         .filter(|repository| !repository.is_empty())
 }
 
@@ -1641,6 +1678,52 @@ mod tests {
         assert_eq!(response.headers()["Docker-Content-Digest"], manifest_digest);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], manifest.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn oci_tags_list_returns_pushed_tags() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = authenticated_state(tempdir.path()).await;
+        let app = build_router(state);
+        let token = test_token("builder", "ci");
+        let manifest = r#"{"schemaVersion":2,"layers":[]}"#;
+
+        for tag in ["v1.0.0", "latest"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/v2/team/image/manifests/{tag}"))
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(
+                            header::CONTENT_TYPE,
+                            "application/vnd.oci.image.manifest.v1+json",
+                        )
+                        .body(Body::from(manifest))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/team/image/tags/list?n=1000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["name"], "team/image");
+        assert_eq!(body["tags"], serde_json::json!(["latest", "v1.0.0"]));
     }
 
     #[tokio::test]

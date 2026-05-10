@@ -46,6 +46,7 @@ pub trait MetadataStore: fmt::Debug + Send + Sync {
     ) -> Result<OciManifestRecord, AppError>;
     async fn store_oci_tag(&self, tag: OciTagRecord) -> Result<(), AppError>;
     async fn oci_tag(&self, repository: &str, tag: &str) -> Result<OciTagRecord, AppError>;
+    async fn list_oci_tags(&self, repository: &str) -> Result<Vec<String>, AppError>;
 }
 
 pub async fn build_metadata_store(
@@ -333,12 +334,16 @@ impl FilesystemMetadataStore {
     }
 
     fn oci_tag_path(&self, repository: &str, tag: &str) -> PathBuf {
+        self.oci_tags_path(repository)
+            .join(format!("{}.json", encode_oci_key(tag)))
+    }
+
+    fn oci_tags_path(&self, repository: &str) -> PathBuf {
         self.directory
             .join("oci")
             .join("repositories")
             .join(encode_oci_key(repository))
             .join("tags")
-            .join(format!("{}.json", encode_oci_key(tag)))
     }
 }
 
@@ -606,6 +611,22 @@ impl MetadataStore for SurrealMetadataStore {
             .map_err(|error| AppError::Internal(format!("failed to read OCI tag: {error}")))?
             .ok_or_else(|| AppError::NotFound(format!("unknown OCI tag '{repository}:{tag}'")))
     }
+
+    async fn list_oci_tags(&self, repository: &str) -> Result<Vec<String>, AppError> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT repository, tag, digest FROM oci_tag \
+                 WHERE repository = $repository ORDER BY tag",
+            )
+            .bind(("repository", repository.to_string()))
+            .await
+            .map_err(|error| AppError::Internal(format!("failed to list OCI tags: {error}")))?;
+        let tags: Vec<OciTagRecord> = response
+            .take(0)
+            .map_err(|error| AppError::Internal(format!("failed to decode OCI tags: {error}")))?;
+        Ok(tags.into_iter().map(|tag| tag.tag).collect())
+    }
 }
 
 #[async_trait]
@@ -770,6 +791,45 @@ impl MetadataStore for FilesystemMetadataStore {
                     error
                 }
             })
+    }
+
+    async fn list_oci_tags(&self, repository: &str) -> Result<Vec<String>, AppError> {
+        let tags_dir = self.oci_tags_path(repository);
+        let mut entries = match tokio::fs::read_dir(&tags_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(AppError::Internal(format!(
+                    "failed to list OCI tags '{}': {error}",
+                    tags_dir.display()
+                )));
+            }
+        };
+        let mut tags = Vec::new();
+        while let Some(entry) = entries.next_entry().await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to read OCI tag directory '{}': {error}",
+                tags_dir.display()
+            ))
+        })? {
+            let file_type = entry.file_type().await.map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to read OCI tag entry '{}': {error}",
+                    entry.path().display()
+                ))
+            })?;
+            if !file_type.is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let record: OciTagRecord = self.read_json(&entry.path(), "OCI tag").await?;
+            if record.repository == repository {
+                tags.push(record.tag);
+            }
+        }
+        tags.sort();
+        Ok(tags)
     }
 }
 

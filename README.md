@@ -2,7 +2,7 @@
 
 `reposnake` is a small Axum service that stores Python distribution files and OCI container images.
 
-It serves the Python Simple Repository API from the service root, stores uploaded artifacts on the filesystem, and accepts Python uploads through a Twine-compatible `/legacy/` endpoint. It also exposes an OCI Distribution-compatible registry under `/v2/`. Uploads and OCI pushes are authorized with JWTs; Python downloads and OCI pulls are public.
+It serves the Python Simple Repository API from the service root, stores uploaded artifacts on the filesystem, and accepts Python uploads through a Twine-compatible POST to `/`. It also exposes an OCI Distribution-compatible registry under `/v2/`. Uploads and OCI pushes are authorized with JWTs; Python downloads and OCI pulls are public.
 
 ## Configuration
 
@@ -79,11 +79,11 @@ Those links resolve under the project page URL.
 
 ## Uploading
 
-Twine can upload to the legacy endpoint with the JWT as the password:
+Twine can upload to the top-level endpoint with the JWT as the password:
 
 ```sh
 twine upload \
-  --repository-url http://localhost:8080/legacy/ \
+  --repository-url http://localhost:8080/ \
   --username __token__ \
   --password "$UPLOAD_JWT" \
   dist/*
@@ -103,7 +103,7 @@ curl -X POST \
   -F 'version=0.1.0' \
   -F "sha256_digest=$(shasum -a 256 dist/example-package-0.1.0.tar.gz | awk '{print $1}')" \
   -F 'content=@dist/example-package-0.1.0.tar.gz' \
-  http://localhost:8080/legacy/
+  http://localhost:8080/
 ```
 
 ## OCI Containers

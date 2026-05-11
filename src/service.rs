@@ -15,7 +15,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 use jsonwebtoken::{Validation, decode};
 use serde::{Deserialize, Serialize};
@@ -58,7 +58,7 @@ pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Res
 pub fn build_router(state: AppState) -> Router {
     let max_upload_bytes = state.max_upload_bytes;
     Router::new()
-        .route("/", get(simple_root))
+        .route("/", get(simple_root).post(upload_distribution))
         .route("/healthz", get(healthz))
         .route(
             "/v2",
@@ -82,8 +82,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{project}", get(simple_project_redirect))
         .route("/{project}/", get(simple_project))
         .route("/{project}/{filename}", get(download_project_package))
-        .route("/legacy", post(upload_distribution))
-        .route("/legacy/", post(upload_distribution))
         .layer(DefaultBodyLimit::max(max_upload_bytes))
         .layer(
             TraceLayer::new_for_http()
@@ -1289,7 +1287,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/legacy/")
+                    .uri("/")
                     .header(
                         header::CONTENT_TYPE,
                         "multipart/form-data; boundary=reposnake-boundary",
@@ -1403,7 +1401,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/legacy/")
+                    .uri("/")
                     .header(
                         header::CONTENT_TYPE,
                         "multipart/form-data; boundary=reposnake-boundary",
@@ -1489,7 +1487,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/legacy/")
+                    .uri("/")
                     .header(
                         header::CONTENT_TYPE,
                         "multipart/form-data; boundary=reposnake-boundary",
@@ -1553,7 +1551,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/legacy/")
+                    .uri("/")
                     .header(
                         header::CONTENT_TYPE,
                         "multipart/form-data; boundary=reposnake-boundary",
@@ -1583,7 +1581,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/legacy/")
+                    .uri("/")
                     .header(
                         header::CONTENT_TYPE,
                         "multipart/form-data; boundary=reposnake-boundary",

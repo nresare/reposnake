@@ -2,7 +2,7 @@
 name = "repo.noa.re"
 replicas = 2
 args = ["-c", "/config/reposnake.toml"]
-config = { "/config/reposnake.toml" = "reposnake/reposnake.toml" }
+config = { "/config/reposnake.toml" = "reposnake.toml" }
 custom-token-audiences = ["idmouse", "sts.amazonaws.com"]
 emptydir-path = "/var/tmp"
 

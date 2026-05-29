@@ -1,6 +1,6 @@
 [[website]]
 name = "repo.noa.re"
-replicas = 2
+replicas = 3
 args = ["-c", "/config/reposnake.toml"]
 config = { "/config/reposnake.toml" = "reposnake.toml" }
 custom-token-audiences = ["idmouse", "sts.amazonaws.com"]

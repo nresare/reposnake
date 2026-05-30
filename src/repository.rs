@@ -11,10 +11,13 @@ use crate::package::{
     FileRecord, ProjectIndex, ProjectSummary, UploadPackage, is_safe_filename,
     is_valid_project_name, normalize_name,
 };
+use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use zip::ZipArchive;
 
 #[derive(Clone)]
 pub struct PackageRepository {
@@ -115,6 +118,47 @@ impl PackageRepository {
         Ok((content, record))
     }
 
+    pub async fn read_file_metadata(
+        &self,
+        normalized_project: &str,
+        metadata_filename: &str,
+    ) -> Result<(Vec<u8>, FileRecord), AppError> {
+        let filename = metadata_filename
+            .strip_suffix(".metadata")
+            .ok_or_else(|| AppError::NotFound(format!("unknown metadata '{metadata_filename}'")))?;
+        let normalized_project = normalize_name(normalized_project);
+        if !is_safe_filename(filename) {
+            return Err(AppError::BadRequest("invalid filename".to_string()));
+        }
+
+        let project = self.project(&normalized_project).await?;
+        let record = project
+            .files
+            .into_iter()
+            .find(|record| record.filename == filename)
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "unknown file '{filename}' for project '{normalized_project}'"
+                ))
+            })?;
+        let metadata_sha256 = record.metadata_sha256.as_deref().ok_or_else(|| {
+            AppError::NotFound(format!(
+                "metadata for package file '{filename}' is not available"
+            ))
+        })?;
+        let sha256 = sha256_bytes(metadata_sha256)?;
+        let content = self.objects.read(&sha256).await.map_err(|error| {
+            if matches!(error, AppError::NotFound(_)) {
+                AppError::NotFound(format!(
+                    "metadata file '{metadata_filename}' is missing from storage"
+                ))
+            } else {
+                error
+            }
+        })?;
+        Ok((content, record))
+    }
+
     pub async fn store_upload(&self, upload: UploadPackage) -> Result<FileRecord, AppError> {
         if !is_valid_project_name(&upload.name) {
             return Err(AppError::BadRequest(format!(
@@ -138,6 +182,10 @@ impl PackageRepository {
 
         let normalized_project = normalize_name(&upload.name);
         let expected_sha256 = sha256_hex(&upload.content);
+        let dist_info_metadata = extract_dist_info_metadata(&upload.filename, &upload.content);
+        let metadata_sha256 = dist_info_metadata
+            .as_ref()
+            .map(|metadata| sha256_hex(metadata));
         if let Some(provided_sha256) = &upload.provided_sha256
             && !provided_sha256.eq_ignore_ascii_case(&expected_sha256)
         {
@@ -153,20 +201,13 @@ impl PackageRepository {
             sha256: expected_sha256,
             size: upload.content.len() as u64,
             requires_python: upload.requires_python,
+            metadata_sha256,
         };
         let project = ProjectSummary {
             name: upload.name,
             normalized_name: normalized_project.clone(),
         };
-        let mut writer = self.objects.create_writer().await?;
-        if let Err(error) = writer.write_chunk(&upload.content).await {
-            writer.abort().await?;
-            return Err(error);
-        }
-        let stored_sha256 = match writer.commit().await {
-            Ok(stored_sha256) => stored_sha256,
-            Err(error) => return Err(error),
-        };
+        let stored_sha256 = self.store_object(&upload.content).await?;
         let stored_sha256 = hex::encode(stored_sha256);
         if stored_sha256 != record.sha256 {
             return Err(AppError::Internal(format!(
@@ -175,14 +216,41 @@ impl PackageRepository {
             )));
         }
 
+        if let Some(metadata) = &dist_info_metadata {
+            let stored_metadata_sha256 = hex::encode(self.store_object(metadata).await?);
+            if record.metadata_sha256.as_deref() != Some(stored_metadata_sha256.as_str()) {
+                self.objects
+                    .delete_if_exists(&sha256_bytes(&record.sha256)?)
+                    .await?;
+                return Err(AppError::Internal(format!(
+                    "stored metadata digest '{stored_metadata_sha256}' did not match expected digest '{}'",
+                    record.metadata_sha256.as_deref().unwrap_or("")
+                )));
+            }
+        }
+
         if let Err(error) = self.metadata.add_file(project, record.clone()).await {
             self.objects
                 .delete_if_exists(&sha256_bytes(&record.sha256)?)
                 .await?;
+            if let Some(metadata_sha256) = &record.metadata_sha256 {
+                self.objects
+                    .delete_if_exists(&sha256_bytes(metadata_sha256)?)
+                    .await?;
+            }
             return Err(error);
         }
 
         Ok(record)
+    }
+
+    async fn store_object(&self, content: &[u8]) -> Result<[u8; 32], AppError> {
+        let mut writer = self.objects.create_writer().await?;
+        if let Err(error) = writer.write_chunk(content).await {
+            writer.abort().await?;
+            return Err(error);
+        }
+        writer.commit().await
     }
 }
 
@@ -206,9 +274,91 @@ fn sha256_bytes(hex_digest: &str) -> Result<[u8; 32], AppError> {
     })
 }
 
+fn extract_dist_info_metadata(filename: &str, content: &[u8]) -> Option<Vec<u8>> {
+    if filename.ends_with(".whl") {
+        return extract_wheel_metadata(content).ok().flatten();
+    }
+    if filename.ends_with(".tar.gz") {
+        return extract_sdist_metadata(content).ok().flatten();
+    }
+    None
+}
+
+fn extract_wheel_metadata(content: &[u8]) -> Result<Option<Vec<u8>>, AppError> {
+    let cursor = Cursor::new(content);
+    let mut archive = ZipArchive::new(cursor).map_err(|error| {
+        AppError::BadRequest(format!("failed to inspect wheel metadata: {error}"))
+    })?;
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index).map_err(|error| {
+            AppError::BadRequest(format!("failed to inspect wheel metadata: {error}"))
+        })?;
+        let name = file.name();
+        if !is_wheel_metadata_path(name) {
+            continue;
+        }
+        let mut metadata = Vec::new();
+        file.read_to_end(&mut metadata).map_err(|error| {
+            AppError::BadRequest(format!("failed to read wheel metadata: {error}"))
+        })?;
+        return Ok(Some(metadata));
+    }
+    Ok(None)
+}
+
+fn is_wheel_metadata_path(path: &str) -> bool {
+    let mut parts = path.split('/');
+    let Some(dist_info) = parts.next() else {
+        return false;
+    };
+    matches!(
+        (
+            dist_info.ends_with(".dist-info"),
+            parts.next(),
+            parts.next()
+        ),
+        (true, Some("METADATA"), None)
+    )
+}
+
+fn extract_sdist_metadata(content: &[u8]) -> Result<Option<Vec<u8>>, AppError> {
+    let decoder = GzDecoder::new(Cursor::new(content));
+    let mut archive = tar::Archive::new(decoder);
+    let entries = archive.entries().map_err(|error| {
+        AppError::BadRequest(format!("failed to inspect sdist metadata: {error}"))
+    })?;
+    for entry in entries {
+        let mut entry = entry.map_err(|error| {
+            AppError::BadRequest(format!("failed to inspect sdist metadata: {error}"))
+        })?;
+        let path = entry.path().map_err(|error| {
+            AppError::BadRequest(format!("failed to inspect sdist metadata: {error}"))
+        })?;
+        if !is_sdist_metadata_path(&path) {
+            continue;
+        }
+        let mut metadata = Vec::new();
+        entry.read_to_end(&mut metadata).map_err(|error| {
+            AppError::BadRequest(format!("failed to read sdist metadata: {error}"))
+        })?;
+        return Ok(Some(metadata));
+    }
+    Ok(None)
+}
+
+fn is_sdist_metadata_path(path: &std::path::Path) -> bool {
+    let mut components = path.components();
+    let first = components.next();
+    let second = components.next();
+    let third = components.next();
+    first.is_some()
+        && second.is_some_and(|component| component.as_os_str() == "PKG-INFO")
+        && third.is_none()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PackageRepository;
+    use super::{PackageRepository, extract_dist_info_metadata};
     use crate::config::Config;
     use crate::package::UploadPackage;
 
@@ -270,6 +420,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extracts_core_metadata_from_gzipped_sdist() {
+        let metadata = b"Metadata-Version: 2.4\nName: reposnake-demo\nVersion: 0.1.0\n";
+        let sdist = sdist_with_metadata(metadata);
+
+        assert_eq!(
+            extract_dist_info_metadata("reposnake_demo-0.1.0.tar.gz", &sdist),
+            Some(metadata.to_vec())
+        );
+    }
+
     #[tokio::test]
     async fn filesystem_metadata_persists_uploaded_package_index() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -324,5 +485,23 @@ projects = ["*"]
         assert_eq!(project.files[0].filename, "reposnake_demo-0.1.0.tar.gz");
         assert_eq!(content, b"package-content");
         assert_eq!(file.requires_python.as_deref(), Some(">=3.11"));
+    }
+
+    fn sdist_with_metadata(metadata: &[u8]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use tar::{Builder, Header};
+
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut archive = Builder::new(encoder);
+        let mut header = Header::new_gnu();
+        header.set_size(metadata.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "reposnake_demo-0.1.0/PKG-INFO", metadata)
+            .unwrap();
+        let encoder = archive.into_inner().unwrap();
+        encoder.finish().unwrap()
     }
 }

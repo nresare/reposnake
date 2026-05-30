@@ -21,6 +21,8 @@ pub struct FileRecord {
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_python: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]

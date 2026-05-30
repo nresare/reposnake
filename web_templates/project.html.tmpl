@@ -12,7 +12,7 @@
 <section class="projects" aria-labelledby="project-title">
 <h1 id="project-title">{{title}}</h1>
 {{#each files}}
-<a href="{{url}}#sha256={{sha256}}"{{#if requires_python}} data-requires-python="{{requires_python}}"{{/if}}>{{filename}}</a>
+<a href="{{url}}#sha256={{sha256}}"{{#if requires_python}} data-requires-python="{{requires_python}}"{{/if}}{{#if metadata_sha256}} data-core-metadata="sha256={{metadata_sha256}}"{{/if}}>{{filename}}</a>
 {{/each}}
 </section>
 </main>

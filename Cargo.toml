@@ -40,8 +40,3 @@ tempfile = "3.27"
 tower = { version = "0.5", features = ["util"] }
 surrealdb = { version = "3.0", default-features = false, features = ["kv-mem"] }
 
-[patch.crates-io]
-surrealdb = { git = "https://github.com/nresare/surrealdb.git", branch = "introduce_surrealdb_client_core_v3.0" }
-surrealdb-types = { git = "https://github.com/nresare/surrealdb.git", branch = "introduce_surrealdb_client_core_v3.0" }
-surrealdb-types-derive = { git = "https://github.com/nresare/surrealdb.git", branch = "introduce_surrealdb_client_core_v3.0" }
-

@@ -165,6 +165,7 @@ fn object_digest_from_filename(filename: &std::ffi::OsStr) -> Option<[u8; 32]> {
 #[async_trait]
 pub trait ObjectStore: fmt::Debug + Send + Sync {
     async fn read(&self, sha256: &[u8; 32]) -> Result<Vec<u8>, AppError>;
+    async fn check_availability(&self) -> Result<(), AppError>;
     async fn create_writer(&self) -> Result<Box<dyn ObjectWriter>, AppError>;
     async fn delete_if_exists(&self, sha256: &[u8; 32]) -> Result<(), AppError>;
 }
@@ -210,6 +211,26 @@ impl ObjectStore for FilesystemObjectStore {
                 ))
             }
         })
+    }
+
+    async fn check_availability(&self) -> Result<(), AppError> {
+        let mut entries = match tokio::fs::read_dir(&self.root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(AppError::Internal(format!(
+                    "failed to list object directory '{}': {error}",
+                    self.root.display()
+                )));
+            }
+        };
+        entries.next_entry().await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to read object directory '{}': {error}",
+                self.root.display()
+            ))
+        })?;
+        Ok(())
     }
 
     async fn create_writer(&self) -> Result<Box<dyn ObjectWriter>, AppError> {
@@ -372,6 +393,24 @@ mod tests {
             }
         }
         assert_eq!(object_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn filesystem_store_availability_check_is_read_only() -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let missing_store = FilesystemObjectStore::new(tempdir.path().join("objects"));
+
+        missing_store.check_availability().await?;
+
+        let store = FilesystemObjectStore::new(tempdir.path());
+        let first: [u8; 32] = Sha256::digest(b"first").into();
+        tokio::fs::create_dir_all(tempdir.path()).await?;
+        tokio::fs::write(tempdir.path().join(hex::encode(first)), b"first").await?;
+        tokio::fs::write(tempdir.path().join("not-a-digest"), b"ignored").await?;
+
+        store.check_availability().await?;
+
         Ok(())
     }
 

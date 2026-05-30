@@ -77,6 +77,23 @@ impl ObjectStore for S3ObjectStore {
         Ok(bytes.into_bytes().to_vec())
     }
 
+    async fn check_availability(&self) -> Result<(), AppError> {
+        self.client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&self.prefix)
+            .max_keys(1)
+            .send()
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to list S3 objects with prefix '{}' in bucket '{}': {error}",
+                    self.prefix, self.bucket
+                ))
+            })?;
+        Ok(())
+    }
+
     async fn create_writer(&self) -> Result<Box<dyn ObjectWriter>, AppError> {
         tokio::fs::create_dir_all(&self.temp_directory)
             .await

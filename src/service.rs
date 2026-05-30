@@ -91,8 +91,10 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn healthz() -> Json<Value> {
-    Json(json!({ "status": "ok" }))
+async fn healthz(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    state.repository.metadata_store().list_projects().await?;
+    state.repository.object_store().check_availability().await?;
+    Ok(Json(json!({ "status": "ok" })))
 }
 
 async fn static_file(Path(path): Path<String>) -> StaticFile<String> {
@@ -1274,6 +1276,28 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn healthz_checks_metadata_and_object_stores() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = unauthenticated_state(tempdir.path()).await;
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    }
 
     #[tokio::test]
     async fn upload_then_serves_simple_html_and_package() {

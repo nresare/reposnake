@@ -297,7 +297,7 @@ async fn download_package(
     Path((project, filename)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> Result<Response, AppError> {
-    package_response(&project, &filename, &state).await
+    file_response(&project, &filename, &state).await
 }
 
 async fn download_project_package(
@@ -313,7 +313,18 @@ async fn download_project_package(
         .into_response());
     }
 
-    package_response(&normalized_project, &filename, &state).await
+    file_response(&normalized_project, &filename, &state).await
+}
+
+async fn file_response(
+    project: &str,
+    filename: &str,
+    state: &AppState,
+) -> Result<Response, AppError> {
+    if filename.ends_with(".metadata") {
+        return metadata_response(project, filename, state).await;
+    }
+    package_response(project, filename, state).await
 }
 
 async fn package_response(
@@ -328,6 +339,23 @@ async fn package_response(
         .header(header::CONTENT_LENGTH, content.len().to_string())
         .body(Body::from(content))
         .map_err(|error| AppError::Internal(format!("failed to build file response: {error}")))
+}
+
+async fn metadata_response(
+    project: &str,
+    filename: &str,
+    state: &AppState,
+) -> Result<Response, AppError> {
+    let (content, _record) = state
+        .repository
+        .read_file_metadata(project, filename)
+        .await?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CONTENT_LENGTH, content.len().to_string())
+        .body(Body::from(content))
+        .map_err(|error| AppError::Internal(format!("failed to build metadata response: {error}")))
 }
 
 async fn oci_get_blob(
@@ -1143,6 +1171,7 @@ struct ProjectFileTemplate {
     url: String,
     sha256: String,
     requires_python: Option<String>,
+    metadata_sha256: Option<String>,
 }
 
 impl From<&FileRecord> for ProjectFileTemplate {
@@ -1152,6 +1181,7 @@ impl From<&FileRecord> for ProjectFileTemplate {
             url: url_path_segment(&file.filename),
             sha256: file.sha256.clone(),
             requires_python: file.requires_python.clone(),
+            metadata_sha256: file.metadata_sha256.clone(),
         }
     }
 }
@@ -1243,6 +1273,8 @@ struct ProjectFileJson {
     size: u64,
     #[serde(rename = "requires-python", skip_serializing_if = "Option::is_none")]
     requires_python: Option<String>,
+    #[serde(rename = "core-metadata", skip_serializing_if = "Option::is_none")]
+    core_metadata: Option<BTreeMap<String, String>>,
 }
 
 impl ProjectFileJson {
@@ -1253,6 +1285,9 @@ impl ProjectFileJson {
             hashes: BTreeMap::from([("sha256".to_string(), file.sha256)]),
             size: file.size,
             requires_python: file.requires_python,
+            core_metadata: file
+                .metadata_sha256
+                .map(|sha256| BTreeMap::from([("sha256".to_string(), sha256)])),
         }
     }
 }
@@ -1518,6 +1553,89 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(body["files"][0]["url"], "reposnake_demo-0.1.0.tar.gz");
+    }
+
+    #[tokio::test]
+    async fn simple_api_serves_pep_714_metadata_for_wheels() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = unauthenticated_state(tempdir.path()).await;
+        let app = build_router(state);
+        let metadata = b"Metadata-Version: 2.4\nName: reposnake-demo\nVersion: 0.1.0\n";
+        let wheel = wheel_with_metadata(metadata);
+        let metadata_sha256 = sha256(metadata);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "multipart/form-data; boundary=reposnake-boundary",
+                    )
+                    .body(Body::from(multipart_upload_body_with_file(
+                        "reposnake_demo",
+                        "0.1.0",
+                        "bdist_wheel",
+                        "py3",
+                        "reposnake_demo-0.1.0-py3-none-any.whl",
+                        &wheel,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/reposnake-demo/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains(&format!("data-core-metadata=\"sha256={metadata_sha256}\"")));
+        assert!(!body.contains("data-dist-info-metadata="));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/reposnake-demo/reposnake_demo-0.1.0-py3-none-any.whl.metadata")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], metadata);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/reposnake-demo/")
+                    .header(header::ACCEPT, "application/vnd.pypi.simple.v1+json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["files"][0]["core-metadata"]["sha256"], metadata_sha256);
     }
 
     #[tokio::test]
@@ -1869,11 +1987,29 @@ mod tests {
     }
 
     fn multipart_upload_body(name: &str, version: &str, content: &[u8]) -> Vec<u8> {
+        multipart_upload_body_with_file(
+            name,
+            version,
+            "sdist",
+            "source",
+            &format!("{name}-{version}.tar.gz"),
+            content,
+        )
+    }
+
+    fn multipart_upload_body_with_file(
+        name: &str,
+        version: &str,
+        filetype: &str,
+        pyversion: &str,
+        filename: &str,
+        content: &[u8],
+    ) -> Vec<u8> {
         let mut body = Vec::new();
         push_field(&mut body, ":action", "file_upload");
         push_field(&mut body, "protocol_version", "1");
-        push_field(&mut body, "filetype", "sdist");
-        push_field(&mut body, "pyversion", "source");
+        push_field(&mut body, "filetype", filetype);
+        push_field(&mut body, "pyversion", pyversion);
         push_field(&mut body, "metadata_version", "2.4");
         push_field(&mut body, "name", name);
         push_field(&mut body, "version", version);
@@ -1881,7 +2017,7 @@ mod tests {
         body.extend_from_slice(b"--reposnake-boundary\r\n");
         body.extend_from_slice(
             format!(
-                "Content-Disposition: form-data; name=\"content\"; filename=\"{name}-{version}.tar.gz\"\r\n"
+                "Content-Disposition: form-data; name=\"content\"; filename=\"{filename}\"\r\n"
             )
             .as_bytes(),
         );
@@ -1889,6 +2025,21 @@ mod tests {
         body.extend_from_slice(content);
         body.extend_from_slice(b"\r\n--reposnake-boundary--\r\n");
         body
+    }
+
+    fn wheel_with_metadata(metadata: &[u8]) -> Vec<u8> {
+        use std::io::{Cursor, Write};
+        use zip::write::SimpleFileOptions;
+
+        let cursor = Cursor::new(Vec::new());
+        let mut wheel = zip::ZipWriter::new(cursor);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        wheel
+            .start_file("reposnake_demo-0.1.0.dist-info/METADATA", options)
+            .unwrap();
+        wheel.write_all(metadata).unwrap();
+        wheel.finish().unwrap().into_inner()
     }
 
     fn push_field(body: &mut Vec<u8>, name: &str, value: &str) {

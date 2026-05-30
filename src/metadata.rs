@@ -106,6 +106,7 @@ struct FileDoc {
     sha256: String,
     size: u64,
     requires_python: Option<String>,
+    metadata_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,7 +411,7 @@ impl SurrealMetadataStore {
         let mut response = self
             .db
             .query(
-                "SELECT normalized_project, filename, version, sha256, size, requires_python \
+                "SELECT normalized_project, filename, version, sha256, size, requires_python, metadata_sha256 \
                  FROM package_file \
                  WHERE normalized_project = $normalized_project \
                  ORDER BY filename",
@@ -431,6 +432,7 @@ impl SurrealMetadataStore {
                 sha256: file.sha256,
                 size: file.size,
                 requires_python: file.requires_python,
+                metadata_sha256: file.metadata_sha256,
             })
             .collect())
     }
@@ -506,6 +508,7 @@ impl MetadataStore for SurrealMetadataStore {
             sha256: file.sha256,
             size: file.size,
             requires_python: file.requires_python,
+            metadata_sha256: file.metadata_sha256,
         };
         let _file: Option<FileDoc> = self
             .db
@@ -1105,6 +1108,7 @@ mod tests {
             sha256: "a3da3fb94769c68c9f728842a4a00408ad28c5f734b093d23cc4d62f51079589".to_string(),
             size: 15,
             requires_python: Some(">=3.11".to_string()),
+            metadata_sha256: None,
         }
     }
 }

@@ -12,7 +12,6 @@ use crate::package::{
     is_valid_project_name, normalize_name,
 };
 use flate2::read::GzDecoder;
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
@@ -183,26 +182,52 @@ impl PackageRepository {
             });
         }
 
-        for manifest in self.metadata.list_oci_manifests().await? {
-            let sha256 = digest_sha256(&manifest.digest)?;
-            add_object_usage(
-                &mut labels_by_digest,
-                &mut category_digests,
-                &sha256,
-                "OCI manifests",
-                format!("{} manifest", manifest.repository),
+        let tags_by_bundle = self
+            .metadata
+            .list_oci_tag_records()
+            .await?
+            .into_iter()
+            .fold(
+                BTreeMap::<String, BTreeSet<String>>::new(),
+                |mut tags, tag| {
+                    tags.entry(tag.digest.clone())
+                        .or_default()
+                        .insert(format!("{}:{}", tag.repository, tag.tag));
+                    tags
+                },
             );
-            let Some(content) = read_known_object(self.objects.as_ref(), &sha256).await? else {
-                continue;
-            };
-            for digest in oci_descriptor_digests(&content)? {
-                let sha256 = digest_sha256(&digest)?;
+
+        for bundle in self.metadata.list_oci_bundles().await? {
+            let labels = tags_by_bundle
+                .get(&bundle.digest)
+                .cloned()
+                .unwrap_or_else(|| {
+                    BTreeSet::from([format!("bundle {}", short_digest(&bundle.digest))])
+                });
+            for object in bundle.objects {
+                let sha256 = digest_sha256(&object.digest)?;
+                let category = oci_category(&object.kind);
+                for label in &labels {
+                    add_object_usage(
+                        &mut labels_by_digest,
+                        &mut category_digests,
+                        &sha256,
+                        category,
+                        format!("{label} {}", object.kind),
+                    );
+                }
+            }
+        }
+
+        for object in self.metadata.list_oci_objects().await? {
+            let sha256 = digest_sha256(&object.digest)?;
+            if !labels_by_digest.contains_key(&sha256) {
                 add_object_usage(
                     &mut labels_by_digest,
                     &mut category_digests,
                     &sha256,
-                    "OCI blobs",
-                    format!("{} blob", manifest.repository),
+                    oci_category(&object.kind),
+                    format!("unbundled OCI {}", object.kind),
                 );
             }
         }
@@ -506,18 +531,6 @@ fn usage_summary(labels: Option<&BTreeSet<String>>) -> String {
     summary
 }
 
-async fn read_known_object(
-    objects: &dyn crate::object_store::ObjectStore,
-    sha256: &str,
-) -> Result<Option<Vec<u8>>, AppError> {
-    let sha256 = sha256_bytes(sha256)?;
-    match objects.read(&sha256).await {
-        Ok(content) => Ok(Some(content)),
-        Err(AppError::NotFound(_)) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
 fn digest_sha256(digest: &str) -> Result<String, AppError> {
     digest
         .strip_prefix("sha256:")
@@ -526,43 +539,24 @@ fn digest_sha256(digest: &str) -> Result<String, AppError> {
         .ok_or_else(|| AppError::Internal(format!("invalid stored OCI digest '{digest}'")))
 }
 
-fn oci_descriptor_digests(content: &[u8]) -> Result<BTreeSet<String>, AppError> {
-    let manifest: OciManifestJson = serde_json::from_slice(content).map_err(|error| {
-        AppError::Internal(format!(
-            "failed to decode OCI manifest for utilization: {error}"
-        ))
-    })?;
-    let mut digests = BTreeSet::new();
-    if let Some(config) = manifest.config
-        && !config.digest.is_empty()
-    {
-        digests.insert(config.digest);
-    }
-    for descriptor in manifest.layers {
-        if !descriptor.digest.is_empty() {
-            digests.insert(descriptor.digest);
-        }
-    }
-    for descriptor in manifest.manifests {
-        if !descriptor.digest.is_empty() {
-            digests.insert(descriptor.digest);
-        }
-    }
-    Ok(digests)
+fn short_digest(digest: &str) -> String {
+    digest
+        .strip_prefix("sha256:")
+        .unwrap_or(digest)
+        .chars()
+        .take(12)
+        .collect()
 }
 
-#[derive(Deserialize)]
-struct OciManifestJson {
-    config: Option<OciDescriptorJson>,
-    #[serde(default)]
-    layers: Vec<OciDescriptorJson>,
-    #[serde(default)]
-    manifests: Vec<OciDescriptorJson>,
-}
-
-#[derive(Deserialize)]
-struct OciDescriptorJson {
-    digest: String,
+fn oci_category(kind: &str) -> &'static str {
+    match kind {
+        "index" => "OCI indexes",
+        "manifest" => "OCI manifests",
+        "config" => "OCI configs",
+        "layer" => "OCI layers",
+        "blob" => "OCI blobs",
+        _ => "OCI objects",
+    }
 }
 
 fn sha256_hex(content: &[u8]) -> String {

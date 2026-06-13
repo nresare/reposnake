@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Object store utilization</title>
+<link rel="stylesheet" href="/static/index.css">
+</head>
+<body>
+<main class="utilization-page">
+<section class="hero compact">
+<p class="eyebrow">Object store</p>
+<h1>Utilization</h1>
+<p class="lede">{{total_size}} across {{total_objects}} objects. {{attributed_size}} across {{attributed_objects}} objects is attributed to known package and OCI metadata.</p>
+</section>
+
+<section class="metric-grid" aria-label="Summary">
+<div class="metric">
+<span class="metric-label">Stored</span>
+<strong>{{total_size}}</strong>
+<span>{{total_objects}} objects</span>
+</div>
+<div class="metric">
+<span class="metric-label">Attributed</span>
+<strong>{{attributed_size}}</strong>
+<span>{{attributed_percent}}% of stored bytes</span>
+</div>
+<div class="metric">
+<span class="metric-label">Unattributed</span>
+<strong>{{unattributed_size}}</strong>
+<span>{{unattributed_objects}} objects</span>
+</div>
+</section>
+
+<section class="utilization-section" aria-labelledby="categories-title">
+<h2 id="categories-title">Storage by source</h2>
+{{#if categories}}
+<div class="bar-list">
+{{#each categories}}
+<div class="bar-row">
+<div class="bar-row-heading">
+<span>{{name}}</span>
+<span>{{size}} · {{object_count}} objects</span>
+</div>
+<div class="bar-track"><div class="bar-fill" style="width: {{percent}}%"></div></div>
+</div>
+{{/each}}
+</div>
+{{else}}
+<p class="empty">No objects are currently stored.</p>
+{{/if}}
+</section>
+
+<section class="utilization-section" aria-labelledby="shared-title">
+<h2 id="shared-title">Shared objects</h2>
+{{#if shared_objects}}
+<table class="utilization-table objects-table">
+<thead>
+<tr><th>Digest</th><th>Size</th><th>Refs</th><th>Amortized</th><th>Referenced by</th></tr>
+</thead>
+<tbody>
+{{#each shared_objects}}
+<tr>
+<td><code title="{{sha256}}">{{short_sha256}}</code></td>
+<td>{{size}}</td>
+<td>{{reference_count}}</td>
+<td>{{amortized_size}}</td>
+<td>{{usage}}</td>
+</tr>
+{{/each}}
+</tbody>
+</table>
+{{else}}
+<p class="empty">No objects are referenced by more than one known package or OCI image.</p>
+{{/if}}
+</section>
+
+<section class="utilization-section" aria-labelledby="projects-title">
+<h2 id="projects-title">Largest Python projects</h2>
+{{#if projects}}
+<table class="utilization-table">
+<thead>
+<tr><th>Project</th><th>Files</th><th>Size</th><th>Share</th></tr>
+</thead>
+<tbody>
+{{#each projects}}
+<tr>
+<td><a href="/{{normalized_name}}/">{{name}}</a></td>
+<td>{{file_count}}</td>
+<td>{{size}}</td>
+<td><div class="inline-bar"><span style="width: {{percent}}%"></span></div></td>
+</tr>
+{{/each}}
+</tbody>
+</table>
+{{else}}
+<p class="empty">No Python projects have been uploaded yet.</p>
+{{/if}}
+</section>
+
+<section class="utilization-section" aria-labelledby="objects-title">
+<h2 id="objects-title">Largest objects</h2>
+{{#if largest_objects}}
+<table class="utilization-table objects-table">
+<thead>
+<tr><th>Digest</th><th>Size</th><th>Refs</th><th>Usage</th></tr>
+</thead>
+<tbody>
+{{#each largest_objects}}
+<tr>
+<td><code title="{{sha256}}">{{short_sha256}}</code></td>
+<td>{{size}}</td>
+<td>{{reference_count}}</td>
+<td>{{usage}}</td>
+</tr>
+{{/each}}
+</tbody>
+</table>
+{{else}}
+<p class="empty">No objects are currently stored.</p>
+{{/if}}
+</section>
+</main>
+</body>
+</html>

@@ -16,6 +16,12 @@ use tracing::{info, warn};
 pub type SharedObjectStore = Arc<dyn ObjectStore>;
 static TEMP_OBJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMetadata {
+    pub sha256: String,
+    pub size: u64,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectMigrationStats {
     pub copied: usize,
@@ -168,6 +174,7 @@ pub trait ObjectStore: fmt::Debug + Send + Sync {
     async fn check_availability(&self) -> Result<(), AppError>;
     async fn create_writer(&self) -> Result<Box<dyn ObjectWriter>, AppError>;
     async fn delete_if_exists(&self, sha256: &[u8; 32]) -> Result<(), AppError>;
+    async fn list_objects(&self) -> Result<Vec<ObjectMetadata>, AppError>;
 }
 
 #[async_trait]
@@ -273,6 +280,53 @@ impl ObjectStore for FilesystemObjectStore {
                 path.display()
             ))),
         }
+    }
+
+    async fn list_objects(&self) -> Result<Vec<ObjectMetadata>, AppError> {
+        let mut entries = match tokio::fs::read_dir(&self.root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(AppError::Internal(format!(
+                    "failed to list object directory '{}': {error}",
+                    self.root.display()
+                )));
+            }
+        };
+
+        let mut objects = Vec::new();
+        while let Some(entry) = entries.next_entry().await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to read object directory '{}': {error}",
+                self.root.display()
+            ))
+        })? {
+            let file_type = entry.file_type().await.map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to inspect object '{}': {error}",
+                    entry.path().display()
+                ))
+            })?;
+            if !file_type.is_file() {
+                continue;
+            }
+            let Some(sha256) = object_digest_from_filename(&entry.file_name()).map(hex::encode)
+            else {
+                continue;
+            };
+            let metadata = entry.metadata().await.map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to stat object '{}': {error}",
+                    entry.path().display()
+                ))
+            })?;
+            objects.push(ObjectMetadata {
+                sha256,
+                size: metadata.len(),
+            });
+        }
+        objects.sort_by(|left, right| left.sha256.cmp(&right.sha256));
+        Ok(objects)
     }
 }
 
@@ -411,6 +465,33 @@ mod tests {
 
         store.check_availability().await?;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn filesystem_store_lists_committed_objects_with_sizes() -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let store = FilesystemObjectStore::new(tempdir.path());
+
+        let mut writer = store.create_writer().await?;
+        writer.write_chunk(b"first").await?;
+        let first = hex::encode(writer.commit().await?);
+        let mut writer = store.create_writer().await?;
+        writer.write_chunk(b"second-object").await?;
+        let second = hex::encode(writer.commit().await?);
+        tokio::fs::write(tempdir.path().join(".reposnake-tmp-ignore"), b"tmp").await?;
+
+        let objects = store.list_objects().await?;
+
+        assert_eq!(objects.len(), 2);
+        assert!(objects.contains(&super::ObjectMetadata {
+            sha256: first,
+            size: 5,
+        }));
+        assert!(objects.contains(&super::ObjectMetadata {
+            sha256: second,
+            size: 13,
+        }));
         Ok(())
     }
 

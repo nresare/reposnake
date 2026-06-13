@@ -37,8 +37,16 @@ main {
     padding: 4.5rem 0;
 }
 
+main.utilization-page {
+    width: min(100% - 2rem, 68rem);
+}
+
 .hero {
     padding-bottom: 2.25rem;
+}
+
+.hero.compact {
+    padding-bottom: 1.5rem;
 }
 
 .eyebrow {
@@ -80,6 +88,124 @@ h2 {
 .usage,
 .projects {
     padding: 2rem 0;
+}
+
+.metric-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.75rem;
+    padding: 1rem 0 1.5rem;
+}
+
+.metric {
+    min-width: 0;
+    padding: 1rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface-soft);
+}
+
+.metric span {
+    display: block;
+    color: var(--muted);
+    font-size: 0.9rem;
+}
+
+.metric .metric-label {
+    margin-bottom: 0.35rem;
+    color: var(--accent-strong);
+    font-size: 0.76rem;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.metric strong {
+    display: block;
+    margin-bottom: 0.25rem;
+    font-size: 1.65rem;
+    line-height: 1.1;
+}
+
+.utilization-section {
+    padding: 1.5rem 0;
+}
+
+.bar-list {
+    display: grid;
+    gap: 0.85rem;
+}
+
+.bar-row-heading {
+    display: flex;
+    gap: 1rem;
+    justify-content: space-between;
+    margin-bottom: 0.35rem;
+    color: var(--muted);
+    font-size: 0.94rem;
+}
+
+.bar-row-heading span:first-child {
+    color: var(--text);
+    font-weight: 650;
+}
+
+.bar-track,
+.inline-bar {
+    overflow: hidden;
+    height: 0.55rem;
+    border-radius: 999px;
+    background: var(--border);
+}
+
+.bar-fill,
+.inline-bar span {
+    display: block;
+    height: 100%;
+    background: var(--accent-strong);
+}
+
+.utilization-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.95rem;
+}
+
+.utilization-table th,
+.utilization-table td {
+    padding: 0.75rem 0.65rem;
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+    vertical-align: middle;
+}
+
+.utilization-table th {
+    color: var(--muted);
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.utilization-table td:nth-child(2),
+.utilization-table td:nth-child(3):not(:last-child) {
+    white-space: nowrap;
+}
+
+.utilization-table a {
+    color: var(--accent-strong);
+    font-weight: 650;
+    text-decoration: none;
+}
+
+.utilization-table a:hover {
+    text-decoration: underline;
+}
+
+.objects-table td:last-child {
+    overflow-wrap: anywhere;
+}
+
+.inline-bar {
+    width: min(12rem, 30vw);
 }
 
 .usage-grid,
@@ -172,6 +298,26 @@ body > a {
     margin: 0.75rem 0;
     color: var(--accent-strong);
     font-weight: 650;
+}
+
+@media (max-width: 42rem) {
+    .metric-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .bar-row-heading {
+        display: block;
+    }
+
+    .utilization-table {
+        display: block;
+        overflow-x: auto;
+        white-space: nowrap;
+    }
+
+    .inline-bar {
+        width: 8rem;
+    }
 }
 
 @media (prefers-color-scheme: dark) {

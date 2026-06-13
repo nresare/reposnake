@@ -12,7 +12,9 @@ use crate::package::{
     is_valid_project_name, normalize_name,
 };
 use flate2::read::GzDecoder;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,6 +26,50 @@ pub struct PackageRepository {
     metadata: SharedMetadataStore,
     objects: SharedObjectStore,
     write_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UtilizationReport {
+    pub total_objects: usize,
+    pub total_bytes: u64,
+    pub attributed_objects: usize,
+    pub attributed_bytes: u64,
+    pub categories: Vec<UtilizationCategory>,
+    pub projects: Vec<ProjectUtilization>,
+    pub shared_objects: Vec<SharedObjectUtilization>,
+    pub largest_objects: Vec<ObjectUtilization>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UtilizationCategory {
+    pub name: String,
+    pub object_count: usize,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectUtilization {
+    pub name: String,
+    pub normalized_name: String,
+    pub file_count: usize,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectUtilization {
+    pub sha256: String,
+    pub size: u64,
+    pub reference_count: usize,
+    pub usage: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SharedObjectUtilization {
+    pub sha256: String,
+    pub size: u64,
+    pub reference_count: usize,
+    pub amortized_size: u64,
+    pub usage: String,
 }
 
 impl std::fmt::Debug for PackageRepository {
@@ -85,6 +131,178 @@ impl PackageRepository {
     pub async fn project(&self, normalized_project: &str) -> Result<ProjectIndex, AppError> {
         let normalized_project = normalize_name(normalized_project);
         self.metadata.project(&normalized_project).await
+    }
+
+    pub async fn utilization_report(&self) -> Result<UtilizationReport, AppError> {
+        let objects_by_digest = self
+            .objects
+            .list_objects()
+            .await?
+            .into_iter()
+            .map(|object| (object.sha256, object.size))
+            .collect::<BTreeMap<_, _>>();
+        let total_objects = objects_by_digest.len();
+        let total_bytes = objects_by_digest.values().sum();
+
+        let mut labels_by_digest = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut category_digests = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut projects = Vec::new();
+
+        for project_summary in self.list_projects().await? {
+            let project = self.project(&project_summary.normalized_name).await?;
+            let mut project_digests = BTreeSet::new();
+            for file in &project.files {
+                add_object_usage(
+                    &mut labels_by_digest,
+                    &mut category_digests,
+                    &file.sha256,
+                    "Python distributions",
+                    format!("{} / {}", project.name, file.filename),
+                );
+                project_digests.insert(file.sha256.clone());
+                if let Some(metadata_sha256) = &file.metadata_sha256 {
+                    add_object_usage(
+                        &mut labels_by_digest,
+                        &mut category_digests,
+                        metadata_sha256,
+                        "Python core metadata",
+                        format!("{} / {}.metadata", project.name, file.filename),
+                    );
+                    project_digests.insert(metadata_sha256.clone());
+                }
+            }
+            let bytes = project_digests
+                .iter()
+                .filter_map(|digest| objects_by_digest.get(digest))
+                .sum();
+            projects.push(ProjectUtilization {
+                name: project.name,
+                normalized_name: project.normalized_name,
+                file_count: project.files.len(),
+                bytes,
+            });
+        }
+
+        for manifest in self.metadata.list_oci_manifests().await? {
+            let sha256 = digest_sha256(&manifest.digest)?;
+            add_object_usage(
+                &mut labels_by_digest,
+                &mut category_digests,
+                &sha256,
+                "OCI manifests",
+                format!("{} manifest", manifest.repository),
+            );
+            let Some(content) = read_known_object(self.objects.as_ref(), &sha256).await? else {
+                continue;
+            };
+            for digest in oci_descriptor_digests(&content)? {
+                let sha256 = digest_sha256(&digest)?;
+                add_object_usage(
+                    &mut labels_by_digest,
+                    &mut category_digests,
+                    &sha256,
+                    "OCI blobs",
+                    format!("{} blob", manifest.repository),
+                );
+            }
+        }
+
+        let attributed_digests = labels_by_digest.keys().cloned().collect::<BTreeSet<_>>();
+        let attributed_objects = attributed_digests.len();
+        let attributed_bytes = attributed_digests
+            .iter()
+            .filter_map(|digest| objects_by_digest.get(digest))
+            .sum();
+
+        let unattributed = objects_by_digest
+            .keys()
+            .filter(|digest| !attributed_digests.contains(*digest))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        category_digests.insert("Other objects".to_string(), unattributed);
+
+        let mut categories = category_digests
+            .into_iter()
+            .map(|(name, digests)| UtilizationCategory {
+                name,
+                object_count: digests.len(),
+                bytes: digests
+                    .iter()
+                    .filter_map(|digest| objects_by_digest.get(digest))
+                    .sum(),
+            })
+            .collect::<Vec<_>>();
+        categories.sort_by(|left, right| {
+            right
+                .bytes
+                .cmp(&left.bytes)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+
+        projects.sort_by(|left, right| {
+            right
+                .bytes
+                .cmp(&left.bytes)
+                .then_with(|| left.normalized_name.cmp(&right.normalized_name))
+        });
+
+        let mut largest_objects = objects_by_digest
+            .iter()
+            .map(|(sha256, size)| {
+                let labels = labels_by_digest.get(sha256);
+                let reference_count = labels.map(BTreeSet::len).unwrap_or(0);
+                ObjectUtilization {
+                    sha256: sha256.clone(),
+                    size: *size,
+                    reference_count,
+                    usage: usage_summary(labels),
+                }
+            })
+            .collect::<Vec<_>>();
+        largest_objects.sort_by(|left, right| {
+            right
+                .size
+                .cmp(&left.size)
+                .then_with(|| left.sha256.cmp(&right.sha256))
+        });
+        largest_objects.truncate(20);
+
+        let mut shared_objects = objects_by_digest
+            .iter()
+            .filter_map(|(sha256, size)| {
+                let labels = labels_by_digest.get(sha256)?;
+                let reference_count = labels.len();
+                if reference_count < 2 {
+                    return None;
+                }
+                Some(SharedObjectUtilization {
+                    sha256: sha256.clone(),
+                    size: *size,
+                    reference_count,
+                    amortized_size: size / reference_count as u64,
+                    usage: usage_summary(Some(labels)),
+                })
+            })
+            .collect::<Vec<_>>();
+        shared_objects.sort_by(|left, right| {
+            right
+                .reference_count
+                .cmp(&left.reference_count)
+                .then_with(|| right.size.cmp(&left.size))
+                .then_with(|| left.sha256.cmp(&right.sha256))
+        });
+        shared_objects.truncate(20);
+
+        Ok(UtilizationReport {
+            total_objects,
+            total_bytes,
+            attributed_objects,
+            attributed_bytes,
+            categories,
+            projects,
+            shared_objects,
+            largest_objects,
+        })
     }
 
     pub async fn read_file(
@@ -252,6 +470,99 @@ impl PackageRepository {
         }
         writer.commit().await
     }
+}
+
+fn add_object_usage(
+    labels_by_digest: &mut BTreeMap<String, BTreeSet<String>>,
+    category_digests: &mut BTreeMap<String, BTreeSet<String>>,
+    sha256: &str,
+    category: &str,
+    label: String,
+) {
+    labels_by_digest
+        .entry(sha256.to_string())
+        .or_default()
+        .insert(label);
+    category_digests
+        .entry(category.to_string())
+        .or_default()
+        .insert(sha256.to_string());
+}
+
+fn usage_summary(labels: Option<&BTreeSet<String>>) -> String {
+    let Some(labels) = labels else {
+        return "Other object".to_string();
+    };
+    let mut summary = labels
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = labels.len().saturating_sub(3);
+    if remaining > 0 {
+        summary.push_str(&format!(" and {remaining} more"));
+    }
+    summary
+}
+
+async fn read_known_object(
+    objects: &dyn crate::object_store::ObjectStore,
+    sha256: &str,
+) -> Result<Option<Vec<u8>>, AppError> {
+    let sha256 = sha256_bytes(sha256)?;
+    match objects.read(&sha256).await {
+        Ok(content) => Ok(Some(content)),
+        Err(AppError::NotFound(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn digest_sha256(digest: &str) -> Result<String, AppError> {
+    digest
+        .strip_prefix("sha256:")
+        .filter(|sha256| sha256.len() == 64 && hex::decode(sha256).is_ok())
+        .map(str::to_string)
+        .ok_or_else(|| AppError::Internal(format!("invalid stored OCI digest '{digest}'")))
+}
+
+fn oci_descriptor_digests(content: &[u8]) -> Result<BTreeSet<String>, AppError> {
+    let manifest: OciManifestJson = serde_json::from_slice(content).map_err(|error| {
+        AppError::Internal(format!(
+            "failed to decode OCI manifest for utilization: {error}"
+        ))
+    })?;
+    let mut digests = BTreeSet::new();
+    if let Some(config) = manifest.config
+        && !config.digest.is_empty()
+    {
+        digests.insert(config.digest);
+    }
+    for descriptor in manifest.layers {
+        if !descriptor.digest.is_empty() {
+            digests.insert(descriptor.digest);
+        }
+    }
+    for descriptor in manifest.manifests {
+        if !descriptor.digest.is_empty() {
+            digests.insert(descriptor.digest);
+        }
+    }
+    Ok(digests)
+}
+
+#[derive(Deserialize)]
+struct OciManifestJson {
+    config: Option<OciDescriptorJson>,
+    #[serde(default)]
+    layers: Vec<OciDescriptorJson>,
+    #[serde(default)]
+    manifests: Vec<OciDescriptorJson>,
+}
+
+#[derive(Deserialize)]
+struct OciDescriptorJson {
+    digest: String,
 }
 
 fn sha256_hex(content: &[u8]) -> String {

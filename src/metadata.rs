@@ -47,7 +47,13 @@ pub trait MetadataStore: fmt::Debug + Send + Sync {
     async fn store_oci_tag(&self, tag: OciTagRecord) -> Result<(), AppError>;
     async fn oci_tag(&self, repository: &str, tag: &str) -> Result<OciTagRecord, AppError>;
     async fn list_oci_tags(&self, repository: &str) -> Result<Vec<String>, AppError>;
+    async fn list_oci_tag_records(&self) -> Result<Vec<OciTagRecord>, AppError>;
     async fn list_oci_manifests(&self) -> Result<Vec<OciManifestRecord>, AppError>;
+    async fn store_oci_object(&self, object: OciObjectRecord) -> Result<(), AppError>;
+    async fn list_oci_objects(&self) -> Result<Vec<OciObjectRecord>, AppError>;
+    async fn store_oci_bundle(&self, bundle: OciBundleRecord) -> Result<(), AppError>;
+    async fn oci_bundle(&self, digest: &str) -> Result<OciBundleRecord, AppError>;
+    async fn list_oci_bundles(&self) -> Result<Vec<OciBundleRecord>, AppError>;
 }
 
 pub async fn build_metadata_store(
@@ -133,6 +139,48 @@ pub struct OciManifestRecord {
     pub repository: String,
     pub digest: String,
     pub media_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "surrealdb",
+    derive(SurrealValue),
+    surreal(crate = "surrealdb::types")
+)]
+pub struct OciObjectRecord {
+    pub digest: String,
+    pub size: u64,
+    pub media_type: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "surrealdb",
+    derive(SurrealValue),
+    surreal(crate = "surrealdb::types")
+)]
+pub struct OciBundleRecord {
+    pub digest: String,
+    pub root_manifest_digest: String,
+    pub root_media_type: String,
+    pub status: String,
+    #[serde(default)]
+    pub objects: Vec<OciObjectRecord>,
+    #[serde(default)]
+    pub missing_objects: Vec<OciMissingObjectRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "surrealdb",
+    derive(SurrealValue),
+    surreal(crate = "surrealdb::types")
+)]
+pub struct OciMissingObjectRecord {
+    pub digest: String,
+    pub media_type: String,
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +367,51 @@ impl FilesystemMetadataStore {
         })
     }
 
+    async fn read_json_files_from_dir<T: for<'de> Deserialize<'de>>(
+        &self,
+        directory: &std::path::Path,
+        kind: &str,
+    ) -> Result<Vec<T>, AppError> {
+        let mut entries = match tokio::fs::read_dir(directory).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(AppError::Internal(format!(
+                    "failed to list {kind} directory '{}': {error}",
+                    directory.display()
+                )));
+            }
+        };
+        let mut records = Vec::new();
+        while let Some(entry) = entries.next_entry().await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to read {kind} directory '{}': {error}",
+                directory.display()
+            ))
+        })? {
+            let file_type = entry.file_type().await.map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to inspect {kind} '{}': {error}",
+                    entry.path().display()
+                ))
+            })?;
+            if !file_type.is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                continue;
+            }
+            records.push(self.read_json(&entry.path(), kind).await?);
+        }
+        Ok(records)
+    }
+
+    async fn read_oci_tag_records_from_dir(
+        &self,
+        directory: &std::path::Path,
+    ) -> Result<Vec<OciTagRecord>, AppError> {
+        self.read_json_files_from_dir(directory, "OCI tag").await
+    }
+
     fn oci_upload_path(&self, uuid: &str) -> PathBuf {
         self.directory
             .join("oci")
@@ -346,6 +439,28 @@ impl FilesystemMetadataStore {
             .join("repositories")
             .join(encode_oci_key(repository))
             .join("tags")
+    }
+
+    fn oci_object_path(&self, digest: &str) -> PathBuf {
+        self.directory
+            .join("oci")
+            .join("objects")
+            .join(format!("{}.json", encode_oci_key(digest)))
+    }
+
+    fn oci_objects_path(&self) -> PathBuf {
+        self.directory.join("oci").join("objects")
+    }
+
+    fn oci_bundle_path(&self, digest: &str) -> PathBuf {
+        self.directory
+            .join("oci")
+            .join("bundles")
+            .join(format!("{}.json", encode_oci_key(digest)))
+    }
+
+    fn oci_bundles_path(&self) -> PathBuf {
+        self.directory.join("oci").join("bundles")
     }
 }
 
@@ -392,6 +507,8 @@ async fn setup_db(db: &Surreal<Any>) -> anyhow::Result<()> {
          DEFINE TABLE IF NOT EXISTS oci_upload; \
          DEFINE TABLE IF NOT EXISTS oci_manifest; \
          DEFINE TABLE IF NOT EXISTS oci_tag; \
+         DEFINE TABLE IF NOT EXISTS oci_object; \
+         DEFINE TABLE IF NOT EXISTS oci_bundle; \
          DEFINE INDEX IF NOT EXISTS packageFileByProjectFilename \
          ON package_file FIELDS normalized_project, filename UNIQUE; \
          DEFINE INDEX IF NOT EXISTS ociManifestByRepositoryDigest \
@@ -632,6 +749,17 @@ impl MetadataStore for SurrealMetadataStore {
         Ok(tags.into_iter().map(|tag| tag.tag).collect())
     }
 
+    async fn list_oci_tag_records(&self) -> Result<Vec<OciTagRecord>, AppError> {
+        let mut response = self
+            .db
+            .query("SELECT repository, tag, digest FROM oci_tag ORDER BY repository, tag")
+            .await
+            .map_err(|error| AppError::Internal(format!("failed to list OCI tags: {error}")))?;
+        response
+            .take(0)
+            .map_err(|error| AppError::Internal(format!("failed to decode OCI tags: {error}")))
+    }
+
     async fn list_oci_manifests(&self) -> Result<Vec<OciManifestRecord>, AppError> {
         let mut response = self
             .db
@@ -641,6 +769,59 @@ impl MetadataStore for SurrealMetadataStore {
         response
             .take(0)
             .map_err(|error| AppError::Internal(format!("failed to decode OCI manifests: {error}")))
+    }
+
+    async fn store_oci_object(&self, object: OciObjectRecord) -> Result<(), AppError> {
+        let _object: Option<OciObjectRecord> = self
+            .db
+            .upsert(("oci_object", encode_oci_key(&object.digest)))
+            .content(object)
+            .await
+            .map_err(|error| AppError::Internal(format!("failed to store OCI object: {error}")))?;
+        Ok(())
+    }
+
+    async fn list_oci_objects(&self) -> Result<Vec<OciObjectRecord>, AppError> {
+        let mut response = self
+            .db
+            .query("SELECT digest, size, media_type, kind FROM oci_object ORDER BY digest")
+            .await
+            .map_err(|error| AppError::Internal(format!("failed to list OCI objects: {error}")))?;
+        response
+            .take(0)
+            .map_err(|error| AppError::Internal(format!("failed to decode OCI objects: {error}")))
+    }
+
+    async fn store_oci_bundle(&self, bundle: OciBundleRecord) -> Result<(), AppError> {
+        let _bundle: Option<OciBundleRecord> = self
+            .db
+            .upsert(("oci_bundle", encode_oci_key(&bundle.digest)))
+            .content(bundle)
+            .await
+            .map_err(|error| AppError::Internal(format!("failed to store OCI bundle: {error}")))?;
+        Ok(())
+    }
+
+    async fn oci_bundle(&self, digest: &str) -> Result<OciBundleRecord, AppError> {
+        self.db
+            .select(("oci_bundle", encode_oci_key(digest)))
+            .await
+            .map_err(|error| AppError::Internal(format!("failed to read OCI bundle: {error}")))?
+            .ok_or_else(|| AppError::NotFound(format!("unknown OCI bundle '{digest}'")))
+    }
+
+    async fn list_oci_bundles(&self) -> Result<Vec<OciBundleRecord>, AppError> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT digest, root_manifest_digest, root_media_type, status, objects, missing_objects \
+                 FROM oci_bundle ORDER BY digest",
+            )
+            .await
+            .map_err(|error| AppError::Internal(format!("failed to list OCI bundles: {error}")))?;
+        response
+            .take(0)
+            .map_err(|error| AppError::Internal(format!("failed to decode OCI bundles: {error}")))
     }
 }
 
@@ -847,6 +1028,50 @@ impl MetadataStore for FilesystemMetadataStore {
         Ok(tags)
     }
 
+    async fn list_oci_tag_records(&self) -> Result<Vec<OciTagRecord>, AppError> {
+        let repositories_dir = self.directory.join("oci").join("repositories");
+        let mut repositories = match tokio::fs::read_dir(&repositories_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(AppError::Internal(format!(
+                    "failed to list OCI repositories '{}': {error}",
+                    repositories_dir.display()
+                )));
+            }
+        };
+
+        let mut tags = Vec::new();
+        while let Some(repository_entry) = repositories.next_entry().await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to read OCI repositories '{}': {error}",
+                repositories_dir.display()
+            ))
+        })? {
+            if !repository_entry
+                .file_type()
+                .await
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "failed to inspect OCI repository '{}': {error}",
+                        repository_entry.path().display()
+                    ))
+                })?
+                .is_dir()
+            {
+                continue;
+            }
+            let tags_dir = repository_entry.path().join("tags");
+            tags.extend(self.read_oci_tag_records_from_dir(&tags_dir).await?);
+        }
+        tags.sort_by(|left, right| {
+            left.repository
+                .cmp(&right.repository)
+                .then_with(|| left.tag.cmp(&right.tag))
+        });
+        Ok(tags)
+    }
+
     async fn list_oci_manifests(&self) -> Result<Vec<OciManifestRecord>, AppError> {
         let repositories_dir = self.directory.join("oci").join("repositories");
         let mut repositories = match tokio::fs::read_dir(&repositories_dir).await {
@@ -913,6 +1138,44 @@ impl MetadataStore for FilesystemMetadataStore {
                 .then_with(|| left.digest.cmp(&right.digest))
         });
         Ok(manifests)
+    }
+
+    async fn store_oci_object(&self, object: OciObjectRecord) -> Result<(), AppError> {
+        self.write_json(&self.oci_object_path(&object.digest), &object)
+            .await
+    }
+
+    async fn list_oci_objects(&self) -> Result<Vec<OciObjectRecord>, AppError> {
+        let mut objects = self
+            .read_json_files_from_dir(&self.oci_objects_path(), "OCI object")
+            .await?;
+        objects.sort_by(|left: &OciObjectRecord, right| left.digest.cmp(&right.digest));
+        Ok(objects)
+    }
+
+    async fn store_oci_bundle(&self, bundle: OciBundleRecord) -> Result<(), AppError> {
+        self.write_json(&self.oci_bundle_path(&bundle.digest), &bundle)
+            .await
+    }
+
+    async fn oci_bundle(&self, digest: &str) -> Result<OciBundleRecord, AppError> {
+        self.read_json(&self.oci_bundle_path(digest), "OCI bundle")
+            .await
+            .map_err(|error| {
+                if matches!(error, AppError::NotFound(_)) {
+                    AppError::NotFound(format!("unknown OCI bundle '{digest}'"))
+                } else {
+                    error
+                }
+            })
+    }
+
+    async fn list_oci_bundles(&self) -> Result<Vec<OciBundleRecord>, AppError> {
+        let mut bundles = self
+            .read_json_files_from_dir(&self.oci_bundles_path(), "OCI bundle")
+            .await?;
+        bundles.sort_by(|left: &OciBundleRecord, right| left.digest.cmp(&right.digest));
+        Ok(bundles)
     }
 }
 

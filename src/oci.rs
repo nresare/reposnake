@@ -2,10 +2,15 @@
 // SPDX-FileCopyrightText: The reposnake contributors
 
 use crate::error::AppError;
-use crate::metadata::{OciManifestRecord, OciTagRecord, OciUploadState, SharedMetadataStore};
+use crate::metadata::{
+    OciBundleRecord, OciManifestRecord, OciMissingObjectRecord, OciObjectRecord, OciTagRecord,
+    OciUploadState, SharedMetadataStore,
+};
 use crate::object_store::SharedObjectStore;
 use axum::body::Bytes;
+use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
@@ -93,6 +98,14 @@ impl OciRegistry {
         let _guard = self.write_lock.lock().await;
         self.store_content_object(&content).await?;
         self.metadata
+            .store_oci_object(oci_object(
+                digest,
+                content.len() as u64,
+                "application/octet-stream",
+                "blob",
+            ))
+            .await?;
+        self.metadata
             .delete_oci_upload(repository, &state.uuid)
             .await?;
         Ok(OciBlob {
@@ -117,6 +130,14 @@ impl OciRegistry {
         }
         let _guard = self.write_lock.lock().await;
         self.store_content_object(&content).await?;
+        self.metadata
+            .store_oci_object(oci_object(
+                digest,
+                content.len() as u64,
+                "application/octet-stream",
+                "blob",
+            ))
+            .await?;
         Ok(OciBlob {
             content: content.to_vec(),
             digest: digest.to_string(),
@@ -165,6 +186,21 @@ impl OciRegistry {
         };
         let _guard = self.write_lock.lock().await;
         self.store_content_object(&content).await?;
+        self.metadata
+            .store_oci_object(oci_object(
+                &digest,
+                content.len() as u64,
+                media_type,
+                kind_for_media_type(media_type),
+            ))
+            .await?;
+        let bundle = self
+            .materialize_bundle(&digest, media_type, &content)
+            .await?;
+        for object in &bundle.objects {
+            self.metadata.store_oci_object(object.clone()).await?;
+        }
+        self.metadata.store_oci_bundle(bundle).await?;
         self.metadata
             .store_oci_manifest(OciManifestRecord {
                 repository: repository.to_string(),
@@ -252,6 +288,139 @@ impl OciRegistry {
         }
         writer.commit().await
     }
+
+    async fn materialize_bundle(
+        &self,
+        digest: &str,
+        media_type: &str,
+        content: &[u8],
+    ) -> Result<OciBundleRecord, AppError> {
+        let mut objects = BTreeMap::from([(
+            digest.to_string(),
+            oci_object(
+                digest,
+                content.len() as u64,
+                media_type,
+                kind_for_media_type(media_type),
+            ),
+        )]);
+        let mut missing_objects = BTreeMap::new();
+        self.collect_manifest_objects(content, &mut objects, &mut missing_objects)
+            .await?;
+        Ok(OciBundleRecord {
+            digest: digest.to_string(),
+            root_manifest_digest: digest.to_string(),
+            root_media_type: media_type.to_string(),
+            status: if missing_objects.is_empty() {
+                "complete".to_string()
+            } else {
+                "incomplete".to_string()
+            },
+            objects: objects.into_values().collect(),
+            missing_objects: missing_objects.into_values().collect(),
+        })
+    }
+
+    async fn collect_manifest_objects(
+        &self,
+        content: &[u8],
+        objects: &mut BTreeMap<String, OciObjectRecord>,
+        missing_objects: &mut BTreeMap<String, OciMissingObjectRecord>,
+    ) -> Result<(), AppError> {
+        let manifest: OciManifestDocument = serde_json::from_slice(content).map_err(|error| {
+            AppError::BadRequest(format!(
+                "failed to decode OCI manifest descriptors: {error}"
+            ))
+        })?;
+        for descriptor in manifest.descriptors() {
+            let media_type = descriptor
+                .media_type
+                .as_deref()
+                .unwrap_or("application/octet-stream");
+            let kind = kind_for_media_type(media_type);
+            let already_seen = objects.contains_key(&descriptor.digest);
+            objects.entry(descriptor.digest.clone()).or_insert_with(|| {
+                oci_object(&descriptor.digest, descriptor.size, media_type, kind)
+            });
+            if matches!(kind, "manifest" | "index") {
+                if already_seen {
+                    continue;
+                }
+                let sha256 = digest_sha256_bytes(&descriptor.digest)?;
+                match self.objects.read(&sha256).await {
+                    Ok(child_content) => {
+                        Box::pin(self.collect_manifest_objects(
+                            &child_content,
+                            objects,
+                            missing_objects,
+                        ))
+                        .await?;
+                    }
+                    Err(AppError::NotFound(_)) => {
+                        missing_objects.insert(
+                            descriptor.digest.clone(),
+                            OciMissingObjectRecord {
+                                digest: descriptor.digest.clone(),
+                                media_type: media_type.to_string(),
+                                kind: kind.to_string(),
+                            },
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn oci_object(digest: &str, size: u64, media_type: &str, kind: &str) -> OciObjectRecord {
+    OciObjectRecord {
+        digest: digest.to_string(),
+        size,
+        media_type: media_type.to_string(),
+        kind: kind.to_string(),
+    }
+}
+
+fn kind_for_media_type(media_type: &str) -> &'static str {
+    if media_type.contains("image.index") || media_type.contains("manifest.list") {
+        "index"
+    } else if media_type.contains("manifest") {
+        "manifest"
+    } else if media_type.contains("config") {
+        "config"
+    } else if media_type.contains("layer") {
+        "layer"
+    } else {
+        "object"
+    }
+}
+
+#[derive(Deserialize)]
+struct OciManifestDocument {
+    config: Option<OciDescriptor>,
+    #[serde(default)]
+    layers: Vec<OciDescriptor>,
+    #[serde(default)]
+    manifests: Vec<OciDescriptor>,
+}
+
+impl OciManifestDocument {
+    fn descriptors(self) -> impl Iterator<Item = OciDescriptor> {
+        self.config
+            .into_iter()
+            .chain(self.layers)
+            .chain(self.manifests)
+    }
+}
+
+#[derive(Deserialize)]
+struct OciDescriptor {
+    #[serde(rename = "mediaType")]
+    media_type: Option<String>,
+    digest: String,
+    size: u64,
 }
 
 pub fn validate_repository_name(repository: &str) -> Result<(), AppError> {

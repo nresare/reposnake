@@ -1751,6 +1751,7 @@ mod tests {
     async fn utilization_dashboard_shows_shared_oci_objects() {
         let tempdir = tempfile::tempdir().unwrap();
         let state = authenticated_state(tempdir.path()).await;
+        let metadata = state.repository.metadata_store();
         let app = build_router(state);
         let token = test_token("builder", "ci");
         let layer = b"shared-layer";
@@ -1772,6 +1773,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
 
+        let mut manifest_digest = None;
         for repository in ["team/image", "team/worker"] {
             let manifest = format!(
                 r#"{{"schemaVersion":2,"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{layer_digest}","size":{}}}]}}"#,
@@ -1794,7 +1796,31 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::CREATED);
+            manifest_digest = Some(
+                response.headers()["Docker-Content-Digest"]
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            );
         }
+
+        let bundle = metadata
+            .oci_bundle(manifest_digest.as_deref().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bundle.status, "complete");
+        assert!(bundle.missing_objects.is_empty());
+        assert!(
+            bundle
+                .objects
+                .iter()
+                .any(|object| object.digest == layer_digest
+                    && object.kind == "layer"
+                    && object.size == layer.len() as u64)
+        );
+        assert!(bundle.objects.iter().any(|object| object.digest
+            == manifest_digest.as_deref().unwrap()
+            && object.kind == "manifest"));
 
         let response = app
             .oneshot(
@@ -1812,7 +1838,53 @@ mod tests {
         assert!(body.contains("<h2 id=\"shared-title\">Shared objects</h2>"));
         assert!(body.contains("<td>2</td>"));
         assert!(body.contains("6 B"));
-        assert!(body.contains("team/image blob, team/worker blob"));
+        assert!(body.contains("team/image:latest layer, team/worker:latest layer"));
+    }
+
+    #[tokio::test]
+    async fn oci_index_with_missing_child_manifest_stores_incomplete_bundle() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = authenticated_state(tempdir.path()).await;
+        let metadata = state.repository.metadata_store();
+        let app = build_router(state);
+        let token = test_token("builder", "ci");
+        let missing_manifest_digest = format!("sha256:{}", sha256(b"missing child manifest"));
+        let index = format!(
+            r#"{{"schemaVersion":2,"manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{missing_manifest_digest}","size":123}}]}}"#
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v2/team/image/manifests/latest")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(
+                        header::CONTENT_TYPE,
+                        "application/vnd.oci.image.index.v1+json",
+                    )
+                    .body(Body::from(index))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bundle_digest = response.headers()["Docker-Content-Digest"]
+            .to_str()
+            .unwrap();
+        let bundle = metadata.oci_bundle(bundle_digest).await.unwrap();
+        assert_eq!(bundle.status, "incomplete");
+        assert_eq!(bundle.missing_objects.len(), 1);
+        assert_eq!(bundle.missing_objects[0].digest, missing_manifest_digest);
+        assert!(
+            bundle
+                .objects
+                .iter()
+                .any(|object| object.digest == missing_manifest_digest
+                    && object.kind == "manifest"
+                    && object.size == 123)
+        );
     }
 
     #[tokio::test]

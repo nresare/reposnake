@@ -17,6 +17,10 @@ impl Templates {
         let mut registry = Handlebars::new();
         registry.register_template("index", WebTemplates::compile("index.html.tmpl")?);
         registry.register_template("project", WebTemplates::compile("project.html.tmpl")?);
+        registry.register_template(
+            "utilization",
+            WebTemplates::compile("utilization.html.tmpl")?,
+        );
         Ok(Self {
             registry: Arc::new(registry),
         })

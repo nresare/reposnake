@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: The reposnake contributors
 
 use crate::error::AppError;
-use crate::object_store::{ObjectStore, ObjectWriter};
+use crate::object_store::{ObjectMetadata, ObjectStore, ObjectWriter};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
@@ -142,6 +142,52 @@ impl ObjectStore for S3ObjectStore {
                 ))
             })?;
         Ok(())
+    }
+
+    async fn list_objects(&self) -> Result<Vec<ObjectMetadata>, AppError> {
+        let mut objects = Vec::new();
+        let mut continuation_token = None;
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&self.prefix);
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+            let output = request.send().await.map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to list S3 objects in bucket '{}' with prefix '{}': {error}",
+                    self.bucket, self.prefix
+                ))
+            })?;
+            for object in output.contents() {
+                let Some(key) = object.key() else {
+                    continue;
+                };
+                let Some(sha256) = key.strip_prefix(&self.prefix) else {
+                    continue;
+                };
+                if sha256.len() != 64 || hex::decode(sha256).is_err() {
+                    continue;
+                }
+                let Some(size) = object.size().and_then(|size| u64::try_from(size).ok()) else {
+                    continue;
+                };
+                objects.push(ObjectMetadata {
+                    sha256: sha256.to_string(),
+                    size,
+                });
+            }
+            if output.is_truncated().unwrap_or(false) {
+                continuation_token = output.next_continuation_token().map(str::to_string);
+            } else {
+                break;
+            }
+        }
+        objects.sort_by(|left, right| left.sha256.cmp(&right.sha256));
+        Ok(objects)
     }
 }
 

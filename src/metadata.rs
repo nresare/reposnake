@@ -47,6 +47,7 @@ pub trait MetadataStore: fmt::Debug + Send + Sync {
     async fn store_oci_tag(&self, tag: OciTagRecord) -> Result<(), AppError>;
     async fn oci_tag(&self, repository: &str, tag: &str) -> Result<OciTagRecord, AppError>;
     async fn list_oci_tags(&self, repository: &str) -> Result<Vec<String>, AppError>;
+    async fn list_oci_manifests(&self) -> Result<Vec<OciManifestRecord>, AppError>;
 }
 
 pub async fn build_metadata_store(
@@ -630,6 +631,17 @@ impl MetadataStore for SurrealMetadataStore {
             .map_err(|error| AppError::Internal(format!("failed to decode OCI tags: {error}")))?;
         Ok(tags.into_iter().map(|tag| tag.tag).collect())
     }
+
+    async fn list_oci_manifests(&self) -> Result<Vec<OciManifestRecord>, AppError> {
+        let mut response = self
+            .db
+            .query("SELECT repository, digest, media_type FROM oci_manifest ORDER BY repository, digest")
+            .await
+            .map_err(|error| AppError::Internal(format!("failed to list OCI manifests: {error}")))?;
+        response
+            .take(0)
+            .map_err(|error| AppError::Internal(format!("failed to decode OCI manifests: {error}")))
+    }
 }
 
 #[async_trait]
@@ -833,6 +845,74 @@ impl MetadataStore for FilesystemMetadataStore {
         }
         tags.sort();
         Ok(tags)
+    }
+
+    async fn list_oci_manifests(&self) -> Result<Vec<OciManifestRecord>, AppError> {
+        let repositories_dir = self.directory.join("oci").join("repositories");
+        let mut repositories = match tokio::fs::read_dir(&repositories_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(AppError::Internal(format!(
+                    "failed to list OCI repositories '{}': {error}",
+                    repositories_dir.display()
+                )));
+            }
+        };
+
+        let mut manifests: Vec<OciManifestRecord> = Vec::new();
+        while let Some(repository_entry) = repositories.next_entry().await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to read OCI repositories '{}': {error}",
+                repositories_dir.display()
+            ))
+        })? {
+            let repository_type = repository_entry.file_type().await.map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to inspect OCI repository '{}': {error}",
+                    repository_entry.path().display()
+                ))
+            })?;
+            if !repository_type.is_dir() {
+                continue;
+            }
+            let manifests_dir = repository_entry.path().join("manifests");
+            let mut entries = match tokio::fs::read_dir(&manifests_dir).await {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(AppError::Internal(format!(
+                        "failed to list OCI manifests '{}': {error}",
+                        manifests_dir.display()
+                    )));
+                }
+            };
+            while let Some(entry) = entries.next_entry().await.map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to read OCI manifests '{}': {error}",
+                    manifests_dir.display()
+                ))
+            })? {
+                let file_type = entry.file_type().await.map_err(|error| {
+                    AppError::Internal(format!(
+                        "failed to inspect OCI manifest '{}': {error}",
+                        entry.path().display()
+                    ))
+                })?;
+                if !file_type.is_file()
+                    || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+                {
+                    continue;
+                }
+                manifests.push(self.read_json(&entry.path(), "OCI manifest").await?);
+            }
+        }
+        manifests.sort_by(|left, right| {
+            left.repository
+                .cmp(&right.repository)
+                .then_with(|| left.digest.cmp(&right.digest))
+        });
+        Ok(manifests)
     }
 }
 

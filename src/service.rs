@@ -9,7 +9,10 @@ use crate::oci::{DOCKER_DISTRIBUTION_API_VERSION, OciRegistry};
 use crate::package::{
     FileRecord, ProjectIndex, ProjectSummary, SIMPLE_API_VERSION, UploadPackage, normalize_name,
 };
-use crate::repository::PackageRepository;
+use crate::repository::{
+    ObjectUtilization, PackageRepository, ProjectUtilization, SharedObjectUtilization,
+    UtilizationCategory, UtilizationReport,
+};
 use crate::web::Templates;
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
@@ -77,6 +80,8 @@ pub fn build_router(state: AppState) -> Router {
                 .put(oci_dispatch)
                 .patch(oci_dispatch),
         )
+        .route("/-/utilization", get(utilization_dashboard))
+        .route("/-/utilisation", get(utilization_dashboard))
         .route("/static/{*path}", get(static_file))
         .route("/packages/{project}/{filename}", get(download_package))
         .route("/{project}", get(simple_project_redirect))
@@ -99,6 +104,20 @@ async fn healthz(State(state): State<AppState>) -> Result<Json<Value>, AppError>
 
 async fn static_file(Path(path): Path<String>) -> StaticFile<String> {
     StaticFile(path)
+}
+
+async fn utilization_dashboard(State(state): State<AppState>) -> Result<Response, AppError> {
+    let report = state.repository.utilization_report().await?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, HTML_CONTENT_TYPE)
+        .body(Body::from(render_utilization_report(
+            &state.templates,
+            &report,
+        )?))
+        .map_err(|error| {
+            AppError::Internal(format!("failed to build utilization response: {error}"))
+        })
 }
 
 async fn oci_api_version_check(method: Method) -> Result<Response, AppError> {
@@ -1137,6 +1156,17 @@ fn render_project_detail(
         .map_err(|error| AppError::Internal(format!("failed to render project detail: {error}")))
 }
 
+fn render_utilization_report(
+    templates: &Templates,
+    report: &UtilizationReport,
+) -> Result<String, AppError> {
+    templates
+        .render("utilization", &UtilizationTemplate::from(report))
+        .map_err(|error| {
+            AppError::Internal(format!("failed to render utilization report: {error}"))
+        })
+}
+
 #[derive(Serialize)]
 struct ProjectListTemplate<'a> {
     simple_api_version: &'static str,
@@ -1165,6 +1195,145 @@ struct ProjectDetailTemplate<'a> {
     simple_api_version: &'static str,
     title: &'a str,
     files: Vec<ProjectFileTemplate>,
+}
+
+#[derive(Serialize)]
+struct UtilizationTemplate {
+    total_objects: usize,
+    total_bytes: u64,
+    total_size: String,
+    attributed_objects: usize,
+    attributed_size: String,
+    attributed_percent: u64,
+    unattributed_objects: usize,
+    unattributed_size: String,
+    categories: Vec<UtilizationCategoryTemplate>,
+    projects: Vec<ProjectUtilizationTemplate>,
+    shared_objects: Vec<SharedObjectUtilizationTemplate>,
+    largest_objects: Vec<ObjectUtilizationTemplate>,
+}
+
+impl From<&UtilizationReport> for UtilizationTemplate {
+    fn from(report: &UtilizationReport) -> Self {
+        Self {
+            total_objects: report.total_objects,
+            total_bytes: report.total_bytes,
+            total_size: human_size(report.total_bytes),
+            attributed_objects: report.attributed_objects,
+            attributed_size: human_size(report.attributed_bytes),
+            attributed_percent: percent(report.attributed_bytes, report.total_bytes),
+            unattributed_objects: report
+                .total_objects
+                .saturating_sub(report.attributed_objects),
+            unattributed_size: human_size(
+                report.total_bytes.saturating_sub(report.attributed_bytes),
+            ),
+            categories: report
+                .categories
+                .iter()
+                .map(|category| UtilizationCategoryTemplate::from_report(category, report))
+                .collect(),
+            projects: report
+                .projects
+                .iter()
+                .map(|project| ProjectUtilizationTemplate::from_report(project, report))
+                .collect(),
+            shared_objects: report
+                .shared_objects
+                .iter()
+                .map(SharedObjectUtilizationTemplate::from)
+                .collect(),
+            largest_objects: report
+                .largest_objects
+                .iter()
+                .map(ObjectUtilizationTemplate::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct UtilizationCategoryTemplate {
+    name: String,
+    object_count: usize,
+    size: String,
+    percent: u64,
+}
+
+impl UtilizationCategoryTemplate {
+    fn from_report(category: &UtilizationCategory, report: &UtilizationReport) -> Self {
+        Self {
+            name: category.name.clone(),
+            object_count: category.object_count,
+            size: human_size(category.bytes),
+            percent: percent(category.bytes, report.total_bytes),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ProjectUtilizationTemplate {
+    name: String,
+    normalized_name: String,
+    file_count: usize,
+    size: String,
+    percent: u64,
+}
+
+impl ProjectUtilizationTemplate {
+    fn from_report(project: &ProjectUtilization, report: &UtilizationReport) -> Self {
+        Self {
+            name: project.name.clone(),
+            normalized_name: project.normalized_name.clone(),
+            file_count: project.file_count,
+            size: human_size(project.bytes),
+            percent: percent(project.bytes, report.total_bytes),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SharedObjectUtilizationTemplate {
+    short_sha256: String,
+    sha256: String,
+    size: String,
+    reference_count: usize,
+    amortized_size: String,
+    usage: String,
+}
+
+impl From<&SharedObjectUtilization> for SharedObjectUtilizationTemplate {
+    fn from(object: &SharedObjectUtilization) -> Self {
+        Self {
+            short_sha256: object.sha256.chars().take(12).collect(),
+            sha256: object.sha256.clone(),
+            size: human_size(object.size),
+            reference_count: object.reference_count,
+            amortized_size: human_size(object.amortized_size),
+            usage: object.usage.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ObjectUtilizationTemplate {
+    short_sha256: String,
+    sha256: String,
+    size: String,
+    reference_count: usize,
+    usage: String,
+}
+
+impl From<&ObjectUtilization> for ObjectUtilizationTemplate {
+    fn from(object: &ObjectUtilization) -> Self {
+        Self {
+            short_sha256: object.sha256.chars().take(12).collect(),
+            sha256: object.sha256.clone(),
+            size: human_size(object.size),
+            reference_count: object.reference_count,
+            usage: object.usage.clone(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1198,6 +1367,34 @@ fn url_path_segment(value: &str) -> String {
         }
     }
     encoded
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = UNITS[0];
+    for next_unit in &UNITS[1..] {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next_unit;
+    }
+    if unit == "B" {
+        format!("{bytes} B")
+    } else if value < 10.0 {
+        format!("{value:.1} {unit}")
+    } else {
+        format!("{value:.0} {unit}")
+    }
+}
+
+fn percent(value: u64, total: u64) -> u64 {
+    if total == 0 {
+        0
+    } else {
+        ((value as f64 / total as f64) * 100.0).round() as u64
+    }
 }
 
 #[derive(Serialize)]
@@ -1486,6 +1683,136 @@ mod tests {
         assert!(
             body.contains("pip install --extra-index-url https://packages.example reposnake-demo")
         );
+    }
+
+    #[tokio::test]
+    async fn utilization_dashboard_shows_object_store_totals() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = unauthenticated_state(tempdir.path()).await;
+        let app = build_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "multipart/form-data; boundary=reposnake-boundary",
+                    )
+                    .body(Body::from(multipart_upload_body(
+                        "reposnake_demo",
+                        "0.1.0",
+                        b"package-content",
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/-/utilization")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<h1>Utilization</h1>"));
+        assert!(body.contains("15 B across 1 objects"));
+        assert!(body.contains("Python distributions"));
+        assert!(body.contains("reposnake_demo-0.1.0.tar.gz"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/-/utilisation")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn utilization_dashboard_shows_shared_oci_objects() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = authenticated_state(tempdir.path()).await;
+        let app = build_router(state);
+        let token = test_token("builder", "ci");
+        let layer = b"shared-layer";
+        let layer_digest = format!("sha256:{}", sha256(layer));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v2/team/image/blobs/uploads/?digest={layer_digest}"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(layer.as_slice()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        for repository in ["team/image", "team/worker"] {
+            let manifest = format!(
+                r#"{{"schemaVersion":2,"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{layer_digest}","size":{}}}]}}"#,
+                layer.len()
+            );
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/v2/{repository}/manifests/latest"))
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(
+                            header::CONTENT_TYPE,
+                            "application/vnd.oci.image.manifest.v1+json",
+                        )
+                        .body(Body::from(manifest))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/-/utilization")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<h2 id=\"shared-title\">Shared objects</h2>"));
+        assert!(body.contains("<td>2</td>"));
+        assert!(body.contains("6 B"));
+        assert!(body.contains("team/image blob, team/worker blob"));
     }
 
     #[tokio::test]
@@ -2000,7 +2327,11 @@ mod tests {
             ),
             publishers: Arc::new(vec![PublisherConfig {
                 name: "ci".to_string(),
-                projects: vec!["reposnake-demo".to_string(), "team/image".to_string()],
+                projects: vec![
+                    "reposnake-demo".to_string(),
+                    "team/image".to_string(),
+                    "team/worker".to_string(),
+                ],
                 identity_provider: Some("buildkite".to_string()),
                 required_claims: BTreeMap::from([("pipeline".to_string(), "ci".to_string())]),
             }]),

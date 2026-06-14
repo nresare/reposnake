@@ -5,7 +5,6 @@ use crate::oci::is_valid_repository_name;
 use crate::package::is_valid_project_name;
 use anyhow::Context;
 use serde::Deserialize;
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -25,7 +24,7 @@ pub struct Config {
     pub roles: Vec<authzoo::RoleConfig>,
     #[serde(rename = "publisher", default)]
     pub publishers: Vec<PublisherConfig>,
-    pub admin: Option<AdminConfig>,
+    pub admin_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -35,16 +34,6 @@ pub struct PublisherConfig {
     pub name: String,
     pub projects: Vec<String>,
     pub role: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct AdminConfig {
-    #[serde(rename = "identity-provider")]
-    pub identity_provider: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "required-claims")]
-    pub required_claims: BTreeMap<String, authzoo::ClaimRequirement>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -160,34 +149,13 @@ impl Config {
             }
         }
 
-        if let Some(admin) = &self.admin
+        if let Some(admin_role) = &self.admin_role
             && !disable_auth
         {
-            let identity_provider = admin
-                .identity_provider
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("admin must define identity-provider"))?;
-            if identity_provider.is_empty() {
-                anyhow::bail!("admin identity-provider must not be empty");
+            if admin_role.is_empty() {
+                anyhow::bail!("admin-role must not be empty");
             }
-            role_validator.ensure_roles_exist([identity_provider])?;
-            let admin_role = role_validator
-                .roles()
-                .get(identity_provider)
-                .expect("admin role existence was checked");
-            for (claim, requirement) in &admin.required_claims {
-                if claim.is_empty() {
-                    anyhow::bail!("admin required-claims must not contain an empty claim name");
-                }
-                requirement.validate("admin", claim)?;
-                if let Some(role_requirement) = admin_role.claims.get(claim)
-                    && role_requirement != requirement
-                {
-                    anyhow::bail!(
-                        "admin required-claims duplicates role claim '{claim}' with a different requirement"
-                    );
-                }
-            }
+            role_validator.ensure_roles_exist([admin_role.as_str()])?;
         }
 
         Ok(())
@@ -423,22 +391,17 @@ role = "buildkite"
     }
 
     #[test]
-    fn parses_admin_config() {
+    fn parses_admin_role_config() {
         let config: Config = toml::from_str(
             r#"
 origin = "http://localhost:8080"
+admin-role = "buildkite"
 
 [[role]]
 name = "buildkite"
 audience = "reposnake"
 issuer = "https://issuer.example"
 validation-key = "shared-secret"
-
-[admin]
-identity-provider = "buildkite"
-
-[admin.required-claims]
-pipeline = "maintenance"
 
 [[publisher]]
 name = "ci"
@@ -449,15 +412,7 @@ role = "buildkite"
         .unwrap();
 
         config.validate(false).unwrap();
-        let admin = config.admin.as_ref().unwrap();
-        assert_eq!(admin.identity_provider.as_deref(), Some("buildkite"));
-        assert_eq!(
-            admin
-                .required_claims
-                .get("pipeline")
-                .map(|requirement| requirement.matches(Some("maintenance"))),
-            Some(true)
-        );
+        assert_eq!(config.admin_role.as_deref(), Some("buildkite"));
     }
 
     #[test]
@@ -465,15 +420,13 @@ role = "buildkite"
         let config: Config = toml::from_str(
             r#"
 origin = "http://localhost:8080"
+admin-role = "other"
 
 [[role]]
 name = "buildkite"
 audience = "reposnake"
 issuer = "https://issuer.example"
 validation-key = "shared-secret"
-
-[admin]
-identity-provider = "other"
 
 [[publisher]]
 name = "ci"

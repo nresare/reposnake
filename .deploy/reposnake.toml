@@ -1,22 +1,19 @@
 bind-address = "0.0.0.0:8080"
 max-upload-bytes = 104857600
 origin = "https://repo.noa.re"
+admin-role = "kubernetes"
 
 [[role]]
 name = "kubernetes"
 audience = "repo.noa.re"
 issuer = "https://k8s.noa.re"
-
-[role.claims]
-sub = "system:serviceaccount:default:default"
+claims = {sub="system:serviceaccount:default:default"}
 
 [[role]]
 name = "buildkite"
 audience = "repo.noa.re"
 issuer = "https://agent.buildkite.com"
-
-[role.claims]
-organization_slug = "nresare"
+claims = {organization_slug="nresare"}
 
 [[publisher]]
 name = "ci"
@@ -38,7 +35,3 @@ uri = "ws://surrealdb.surrealdb:8000"
 [metadata-store.idmouse]
 url = "http://idmouse.idmouse.svc/token/reposnake"
 token-path = "/var/run/secrets/tokens/idmouse"
-
-[admin]
-identity-provider = "kubernetes"
-required-claims = {sub="system:serviceaccount:default:default"}

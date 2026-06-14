@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: The reposnake contributors
 
 use crate::auth;
-use crate::config::{AdminConfig, Config, PublisherConfig};
+use crate::config::{Config, PublisherConfig};
 use crate::embed::StaticFile;
 use crate::error::AppError;
 use crate::oci::{DOCKER_DISTRIBUTION_API_VERSION, OciRegistry};
@@ -38,13 +38,11 @@ pub struct AppState {
     pub oci_registry: OciRegistry,
     pub subject_validator: SubjectValidator,
     pub publishers: Arc<Vec<PublisherConfig>>,
-    pub admin: Option<AdminConfig>,
+    pub admin_role: Option<String>,
     pub max_upload_bytes: usize,
     pub templates: Templates,
     pub origin: String,
 }
-
-const ADMIN_ROLE_PREFIX: &str = "__reposnake_admin:";
 
 pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Result<AppState> {
     auth::install_jwt_crypto_provider();
@@ -53,54 +51,13 @@ pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Res
     Ok(AppState {
         oci_registry: OciRegistry::new(repository.metadata_store(), repository.object_store()),
         repository,
-        subject_validator: SubjectValidator::new(auth_roles(config, disable_auth)?, disable_auth)?,
+        subject_validator: SubjectValidator::new(config.roles.clone(), disable_auth)?,
         publishers: Arc::new(config.publishers.clone()),
-        admin: config.admin.clone(),
+        admin_role: config.admin_role.clone(),
         max_upload_bytes: config.max_upload_bytes,
         templates: Templates::new()?,
         origin: config.origin.clone(),
     })
-}
-
-fn auth_roles(config: &Config, disable_auth: bool) -> anyhow::Result<Vec<authzoo::RoleConfig>> {
-    let mut roles = config.roles.clone();
-    if disable_auth {
-        return Ok(roles);
-    }
-    let Some(admin) = &config.admin else {
-        return Ok(roles);
-    };
-    let Some(base_role_name) = admin.identity_provider.as_deref() else {
-        return Ok(roles);
-    };
-    let Some(base_role) = roles.iter().find(|role| role.name == base_role_name) else {
-        return Ok(roles);
-    };
-
-    let mut admin_role = base_role.clone();
-    admin_role.name = admin_role_name(base_role_name);
-    if roles.iter().any(|role| role.name == admin_role.name) {
-        anyhow::bail!(
-            "internal admin role '{}' conflicts with configured role",
-            admin_role.name
-        );
-    }
-    for (claim, requirement) in &admin.required_claims {
-        if let Some(role_requirement) = admin_role.claims.get(claim)
-            && role_requirement != requirement
-        {
-            anyhow::bail!(
-                "admin required-claims duplicates role claim '{claim}' with a different requirement"
-            );
-        }
-        admin_role.claims.insert(claim.clone(), requirement.clone());
-    }
-    roles.push(admin_role);
-    Ok(roles)
-}
-
-fn admin_role_name(base_role_name: &str) -> String {
-    format!("{ADMIN_ROLE_PREFIX}{base_role_name}")
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -694,20 +651,16 @@ impl AppState {
             return Ok(());
         }
 
-        let Some(admin) = &self.admin else {
+        let Some(admin_role) = &self.admin_role else {
             return Err(AppError::NotFound(
                 "admin endpoints are not configured".to_string(),
             ));
         };
-        let role = admin.identity_provider.as_deref().ok_or_else(|| {
-            AppError::Internal("admin config is missing a role reference".to_string())
-        })?;
         let bearer_token = auth::extract_upload_token(headers)?;
         let matching_roles = self.subject_validator.validate(Some(&bearer_token))?;
-        let admin_role = admin_role_name(role);
-        if !matching_roles.contains(&admin_role) {
+        if !matching_roles.contains(admin_role) {
             return Err(AppError::Forbidden(
-                "token claims do not satisfy the admin policy".to_string(),
+                "token does not satisfy the admin role".to_string(),
             ));
         }
         debug!(role = %admin_role, "admin authorization check passed");
@@ -1507,8 +1460,8 @@ impl ProjectFileJson {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, SubjectValidator, admin_role_name, build_router};
-    use crate::config::{AdminConfig, PublisherConfig};
+    use super::{AppState, SubjectValidator, build_router};
+    use crate::config::PublisherConfig;
     use crate::metadata::OciManifestRecord;
     use crate::oci::OciRegistry;
     use crate::package::SIMPLE_API_VERSION;
@@ -2549,7 +2502,7 @@ mod tests {
             repository,
             subject_validator: SubjectValidator::new(Vec::new(), true).unwrap(),
             publishers: Arc::new(Vec::new()),
-            admin: None,
+            admin_role: None,
             max_upload_bytes: 1024 * 1024,
             templates: Templates::new().unwrap(),
             origin: "https://packages.example".to_string(),
@@ -2572,7 +2525,7 @@ mod tests {
                 ],
                 role: Some("buildkite".to_string()),
             }]),
-            admin: None,
+            admin_role: None,
             max_upload_bytes: 1024 * 1024,
             templates: Templates::new().unwrap(),
             origin: "https://packages.example".to_string(),
@@ -2581,21 +2534,7 @@ mod tests {
 
     async fn admin_state(path: &std::path::Path) -> AppState {
         let mut state = authenticated_state(path).await;
-        state.admin = Some(AdminConfig {
-            identity_provider: Some("buildkite".to_string()),
-            required_claims: BTreeMap::from([(
-                "pipeline".to_string(),
-                authzoo::ClaimRequirement::equals("ci"),
-            )]),
-        });
-        state.subject_validator = SubjectValidator::new(
-            vec![
-                buildkite_role("buildkite"),
-                buildkite_role(&admin_role_name("buildkite")),
-            ],
-            false,
-        )
-        .unwrap();
+        state.admin_role = Some("buildkite".to_string());
         state
     }
 

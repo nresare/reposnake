@@ -204,6 +204,16 @@ h2 {
     overflow-wrap: anywhere;
 }
 
+.shared-layer-table td:nth-child(4),
+.shared-layer-table td:nth-child(5),
+.shared-layer-table td:nth-child(6) {
+    white-space: nowrap;
+}
+
+.shared-layer-table td:last-child {
+    overflow-wrap: anywhere;
+}
+
 .inline-bar {
     width: min(12rem, 30vw);
 }

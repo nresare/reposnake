@@ -10,7 +10,7 @@ use crate::package::{
     FileRecord, ProjectIndex, ProjectSummary, SIMPLE_API_VERSION, UploadPackage, normalize_name,
 };
 use crate::repository::{
-    ObjectUtilization, PackageRepository, ProjectUtilization, SharedObjectUtilization,
+    ObjectUtilization, PackageRepository, ProjectUtilization, SharedLayerGroupUtilization,
     UtilizationCategory, UtilizationReport,
 };
 use crate::web::Templates;
@@ -20,6 +20,7 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1176,7 +1177,7 @@ struct UtilizationTemplate {
     unattributed_size: String,
     categories: Vec<UtilizationCategoryTemplate>,
     projects: Vec<ProjectUtilizationTemplate>,
-    shared_objects: Vec<SharedObjectUtilizationTemplate>,
+    shared_layer_groups: Vec<SharedLayerGroupUtilizationTemplate>,
     largest_objects: Vec<ObjectUtilizationTemplate>,
 }
 
@@ -1205,10 +1206,10 @@ impl From<&UtilizationReport> for UtilizationTemplate {
                 .iter()
                 .map(|project| ProjectUtilizationTemplate::from_report(project, report))
                 .collect(),
-            shared_objects: report
-                .shared_objects
+            shared_layer_groups: report
+                .shared_layer_groups
                 .iter()
-                .map(SharedObjectUtilizationTemplate::from)
+                .map(SharedLayerGroupUtilizationTemplate::from)
                 .collect(),
             largest_objects: report
                 .largest_objects
@@ -1260,24 +1261,30 @@ impl ProjectUtilizationTemplate {
 }
 
 #[derive(Serialize)]
-struct SharedObjectUtilizationTemplate {
-    short_sha256: String,
-    sha256: String,
+struct SharedLayerGroupUtilizationTemplate {
+    id: String,
     size: String,
-    reference_count: usize,
-    amortized_size: String,
+    layer_count: usize,
+    manifest_count: usize,
+    manifest_label: String,
+    oldest_created: String,
+    newest_created: String,
+    layers: String,
     usage: String,
 }
 
-impl From<&SharedObjectUtilization> for SharedObjectUtilizationTemplate {
-    fn from(object: &SharedObjectUtilization) -> Self {
+impl From<&SharedLayerGroupUtilization> for SharedLayerGroupUtilizationTemplate {
+    fn from(group: &SharedLayerGroupUtilization) -> Self {
         Self {
-            short_sha256: object.sha256.chars().take(12).collect(),
-            sha256: object.sha256.clone(),
-            size: human_size(object.size),
-            reference_count: object.reference_count,
-            amortized_size: human_size(object.amortized_size),
-            usage: object.usage.clone(),
+            id: group.id.clone(),
+            size: human_size(group.size),
+            layer_count: group.layer_count,
+            manifest_count: group.manifest_count,
+            manifest_label: pluralize(group.manifest_count, "manifest"),
+            oldest_created: date_label(group.oldest_created),
+            newest_created: date_label(group.newest_created),
+            layers: group.layers.clone(),
+            usage: group.usage.clone(),
         }
     }
 }
@@ -1353,6 +1360,20 @@ fn human_size(bytes: u64) -> String {
         format!("{value:.1} {unit}")
     } else {
         format!("{value:.0} {unit}")
+    }
+}
+
+fn date_label(value: Option<DateTime<Utc>>) -> String {
+    value
+        .map(|value| value.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn pluralize(count: usize, singular: &str) -> String {
+    if count == 1 {
+        format!("{count} {singular}")
+    } else {
+        format!("{count} {singular}s")
     }
 }
 
@@ -1716,7 +1737,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn utilization_dashboard_shows_shared_oci_objects() {
+    async fn utilization_dashboard_shows_shared_oci_layer_groups() {
         let tempdir = tempfile::tempdir().unwrap();
         let state = authenticated_state(tempdir.path()).await;
         let metadata = state.repository.metadata_store();
@@ -1744,7 +1765,7 @@ mod tests {
         let mut manifest_digest = None;
         for repository in ["team/image", "team/worker"] {
             let manifest = format!(
-                r#"{{"schemaVersion":2,"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{layer_digest}","size":{}}}]}}"#,
+                r#"{{"schemaVersion":2,"annotations":{{"org.opencontainers.image.ref.name":"{repository}"}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{layer_digest}","size":{}}}]}}"#,
                 layer.len()
             );
             let response = app
@@ -1803,10 +1824,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("<h2 id=\"shared-title\">Shared objects</h2>"));
-        assert!(body.contains("<td>2</td>"));
-        assert!(body.contains("6 B"));
-        assert!(body.contains("team/image:latest layer, team/worker:latest layer"));
+        assert!(body.contains("<h2 id=\"shared-title\">Shared layer groups</h2>"));
+        assert!(body.contains("<td>1</td>"));
+        assert!(body.contains("2 manifests"));
+        assert!(body.contains("12 B"));
+        assert!(body.contains("team/image:latest, team/worker:latest"));
     }
 
     #[tokio::test]

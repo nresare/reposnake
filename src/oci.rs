@@ -11,13 +11,16 @@ use axum::body::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 pub const DOCKER_DISTRIBUTION_API_VERSION: &str = "registry/2.0";
+const DOCKER_REFERENCE_TYPE_ANNOTATION: &str = "vnd.docker.reference.type";
+const DOCKER_REFERENCE_DIGEST_ANNOTATION: &str = "vnd.docker.reference.digest";
+const DOCKER_ATTESTATION_MANIFEST_TYPE: &str = "attestation-manifest";
 static UPLOAD_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -215,16 +218,15 @@ impl OciRegistry {
         let bundle = self
             .materialize_bundle(&digest, media_type, &content)
             .await?;
-        for object in &bundle.objects {
-            self.metadata.store_oci_object(object.clone()).await?;
-        }
-        self.metadata.store_oci_bundle(bundle).await?;
+        self.store_bundle(bundle).await?;
         self.metadata
             .store_oci_manifest(OciManifestRecord {
                 repository: repository.to_string(),
                 digest: digest.clone(),
                 media_type: media_type.to_string(),
             })
+            .await?;
+        self.attach_attestations_from_manifest(repository, media_type, &content)
             .await?;
 
         if !is_digest(reference) {
@@ -290,8 +292,8 @@ impl OciRegistry {
             .list_oci_bundles()
             .await?
             .into_iter()
-            .map(|bundle| bundle.digest)
-            .collect::<BTreeSet<_>>();
+            .map(|bundle| (bundle.digest.clone(), bundle))
+            .collect::<BTreeMap<_, _>>();
         let tags_by_digest = self
             .metadata
             .list_oci_tag_records()
@@ -303,12 +305,17 @@ impl OciRegistry {
                     .push(format!("{}:{}", tag.repository, tag.tag));
                 tags
             });
-        let mut pending = self
-            .metadata
-            .list_oci_manifests()
-            .await?
+        let manifests = self.metadata.list_oci_manifests().await?;
+        let extras_by_digest = self.attestation_extras_by_subject(&manifests).await?;
+        let mut pending = manifests
             .into_iter()
-            .filter(|manifest| !existing_bundles.contains(&manifest.digest))
+            .filter(|manifest| {
+                !existing_bundles.contains_key(&manifest.digest)
+                    || bundle_needs_attestation_extras(
+                        existing_bundles.get(&manifest.digest),
+                        extras_by_digest.get(&manifest.digest),
+                    )
+            })
             .fold(BTreeMap::new(), |mut manifests, manifest| {
                 manifests.entry(manifest.digest.clone()).or_insert(manifest);
                 manifests
@@ -333,7 +340,11 @@ impl OciRegistry {
         let mut incomplete = 0;
         let mut errors = Vec::new();
         for manifest in pending.into_iter().take(limit) {
-            match self.migrate_manifest_metadata(&manifest).await {
+            let extras = extras_by_digest
+                .get(&manifest.digest)
+                .cloned()
+                .unwrap_or_default();
+            match self.migrate_manifest_metadata(&manifest, &extras).await {
                 Ok(bundle) => {
                     converted += 1;
                     let tags = tags_by_digest
@@ -423,6 +434,7 @@ impl OciRegistry {
     async fn migrate_manifest_metadata(
         &self,
         manifest: &OciManifestRecord,
+        extras: &[OciDescriptor],
     ) -> Result<OciBundleRecord, AppError> {
         let sha256 = digest_sha256_bytes(&manifest.digest)?;
         let content = self.objects.read(&sha256).await.map_err(|error| {
@@ -436,12 +448,14 @@ impl OciRegistry {
             }
         })?;
         let bundle = self
-            .materialize_bundle(&manifest.digest, &manifest.media_type, &content)
+            .materialize_bundle_with_extras(
+                &manifest.digest,
+                &manifest.media_type,
+                &content,
+                extras,
+            )
             .await?;
-        for object in &bundle.objects {
-            self.metadata.store_oci_object(object.clone()).await?;
-        }
-        self.metadata.store_oci_bundle(bundle.clone()).await?;
+        self.store_bundle(bundle.clone()).await?;
         Ok(bundle)
     }
 
@@ -450,6 +464,17 @@ impl OciRegistry {
         digest: &str,
         media_type: &str,
         content: &[u8],
+    ) -> Result<OciBundleRecord, AppError> {
+        self.materialize_bundle_with_extras(digest, media_type, content, &[])
+            .await
+    }
+
+    async fn materialize_bundle_with_extras(
+        &self,
+        digest: &str,
+        media_type: &str,
+        content: &[u8],
+        extras: &[OciDescriptor],
     ) -> Result<OciBundleRecord, AppError> {
         let mut objects = BTreeMap::from([(
             digest.to_string(),
@@ -462,8 +487,24 @@ impl OciRegistry {
         )]);
         let mut missing_objects = BTreeMap::new();
         let mut created = None;
-        self.collect_manifest_objects(content, &mut objects, &mut missing_objects, &mut created)
+        self.collect_manifest_objects(
+            content,
+            &mut objects,
+            &mut missing_objects,
+            &mut created,
+            true,
+        )
+        .await?;
+        for descriptor in extras {
+            Box::pin(self.collect_descriptor_object(
+                descriptor,
+                &mut objects,
+                &mut missing_objects,
+                &mut created,
+                false,
+            ))
             .await?;
+        }
         Ok(OciBundleRecord {
             digest: digest.to_string(),
             root_manifest_digest: digest.to_string(),
@@ -485,6 +526,7 @@ impl OciRegistry {
         objects: &mut BTreeMap<String, OciObjectRecord>,
         missing_objects: &mut BTreeMap<String, OciMissingObjectRecord>,
         created: &mut Option<DateTime<Utc>>,
+        collect_created: bool,
     ) -> Result<(), AppError> {
         let manifest: OciManifestDocument = serde_json::from_slice(content).map_err(|error| {
             AppError::BadRequest(format!(
@@ -492,52 +534,146 @@ impl OciRegistry {
             ))
         })?;
         for descriptor in manifest.descriptors() {
-            let media_type = descriptor
-                .media_type
-                .as_deref()
-                .unwrap_or("application/octet-stream");
-            let kind = kind_for_media_type(media_type);
-            let already_seen = objects.contains_key(&descriptor.digest);
-            objects.entry(descriptor.digest.clone()).or_insert_with(|| {
-                oci_object(&descriptor.digest, descriptor.size, media_type, kind)
-            });
-            if kind == "config" {
+            Box::pin(self.collect_descriptor_object(
+                &descriptor,
+                objects,
+                missing_objects,
+                created,
+                collect_created,
+            ))
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn collect_descriptor_object(
+        &self,
+        descriptor: &OciDescriptor,
+        objects: &mut BTreeMap<String, OciObjectRecord>,
+        missing_objects: &mut BTreeMap<String, OciMissingObjectRecord>,
+        created: &mut Option<DateTime<Utc>>,
+        collect_created: bool,
+    ) -> Result<(), AppError> {
+        let media_type = descriptor
+            .media_type
+            .as_deref()
+            .unwrap_or("application/octet-stream");
+        let kind = kind_for_media_type(media_type);
+        let already_seen = objects.contains_key(&descriptor.digest);
+        objects
+            .entry(descriptor.digest.clone())
+            .or_insert_with(|| oci_object(&descriptor.digest, descriptor.size, media_type, kind));
+        if kind == "config" {
+            if collect_created {
                 let sha256 = digest_sha256_bytes(&descriptor.digest)?;
                 match self.objects.read(&sha256).await {
                     Ok(config_content) => update_created_from_config(created, &config_content),
                     Err(AppError::NotFound(_)) => {}
                     Err(error) => return Err(error),
                 }
-            } else if matches!(kind, "manifest" | "index") {
-                if already_seen {
-                    continue;
+            }
+        } else if matches!(kind, "manifest" | "index") {
+            if already_seen {
+                return Ok(());
+            }
+            let sha256 = digest_sha256_bytes(&descriptor.digest)?;
+            match self.objects.read(&sha256).await {
+                Ok(child_content) => {
+                    Box::pin(self.collect_manifest_objects(
+                        &child_content,
+                        objects,
+                        missing_objects,
+                        created,
+                        collect_created,
+                    ))
+                    .await?;
                 }
-                let sha256 = digest_sha256_bytes(&descriptor.digest)?;
-                match self.objects.read(&sha256).await {
-                    Ok(child_content) => {
-                        Box::pin(self.collect_manifest_objects(
-                            &child_content,
-                            objects,
-                            missing_objects,
-                            created,
-                        ))
-                        .await?;
-                    }
-                    Err(AppError::NotFound(_)) => {
-                        missing_objects.insert(
-                            descriptor.digest.clone(),
-                            OciMissingObjectRecord {
-                                digest: descriptor.digest.clone(),
-                                media_type: media_type.to_string(),
-                                kind: kind.to_string(),
-                            },
-                        );
-                    }
-                    Err(error) => return Err(error),
+                Err(AppError::NotFound(_)) => {
+                    missing_objects.insert(
+                        descriptor.digest.clone(),
+                        OciMissingObjectRecord {
+                            digest: descriptor.digest.clone(),
+                            media_type: media_type.to_string(),
+                            kind: kind.to_string(),
+                        },
+                    );
                 }
+                Err(error) => return Err(error),
             }
         }
         Ok(())
+    }
+
+    async fn store_bundle(&self, bundle: OciBundleRecord) -> Result<(), AppError> {
+        for object in &bundle.objects {
+            self.metadata.store_oci_object(object.clone()).await?;
+        }
+        self.metadata.store_oci_bundle(bundle).await
+    }
+
+    async fn attach_attestations_from_manifest(
+        &self,
+        repository: &str,
+        media_type: &str,
+        content: &[u8],
+    ) -> Result<(), AppError> {
+        if kind_for_media_type(media_type) != "index" {
+            return Ok(());
+        }
+        for (subject_digest, attestation) in attestation_extras(content)? {
+            let subject_content = match self
+                .objects
+                .read(&digest_sha256_bytes(&subject_digest)?)
+                .await
+            {
+                Ok(content) => content,
+                Err(AppError::NotFound(_)) => {
+                    warn!(
+                        repository,
+                        subject_digest,
+                        attestation_digest = %attestation.digest,
+                        "skipping OCI attestation attachment because subject manifest is missing"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let subject_media_type = subject_media_type(content, &subject_digest)
+                .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
+            let bundle = self
+                .materialize_bundle_with_extras(
+                    &subject_digest,
+                    &subject_media_type,
+                    &subject_content,
+                    &[attestation],
+                )
+                .await?;
+            self.store_bundle(bundle).await?;
+        }
+        Ok(())
+    }
+
+    async fn attestation_extras_by_subject(
+        &self,
+        manifests: &[OciManifestRecord],
+    ) -> Result<BTreeMap<String, Vec<OciDescriptor>>, AppError> {
+        let mut extras = BTreeMap::<String, Vec<OciDescriptor>>::new();
+        for manifest in manifests {
+            if kind_for_media_type(&manifest.media_type) != "index" {
+                continue;
+            }
+            let Ok(content) = self
+                .objects
+                .read(&digest_sha256_bytes(&manifest.digest)?)
+                .await
+            else {
+                continue;
+            };
+            for (subject_digest, attestation) in attestation_extras(&content)? {
+                extras.entry(subject_digest).or_default().push(attestation);
+            }
+        }
+        Ok(extras)
     }
 }
 
@@ -582,12 +718,65 @@ impl OciManifestDocument {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct OciDescriptor {
     #[serde(rename = "mediaType")]
     media_type: Option<String>,
     digest: String,
     size: u64,
+    #[serde(default)]
+    annotations: BTreeMap<String, String>,
+}
+
+fn attestation_extras(content: &[u8]) -> Result<Vec<(String, OciDescriptor)>, AppError> {
+    let manifest: OciManifestDocument = serde_json::from_slice(content).map_err(|error| {
+        AppError::BadRequest(format!(
+            "failed to decode OCI manifest descriptors: {error}"
+        ))
+    })?;
+    Ok(manifest
+        .manifests
+        .into_iter()
+        .filter_map(|descriptor| {
+            let reference_type = descriptor
+                .annotations
+                .get(DOCKER_REFERENCE_TYPE_ANNOTATION)?;
+            if reference_type != DOCKER_ATTESTATION_MANIFEST_TYPE {
+                return None;
+            }
+            let subject_digest = descriptor
+                .annotations
+                .get(DOCKER_REFERENCE_DIGEST_ANNOTATION)?
+                .clone();
+            Some((subject_digest, descriptor))
+        })
+        .collect())
+}
+
+fn subject_media_type(content: &[u8], subject_digest: &str) -> Option<String> {
+    let manifest: OciManifestDocument = serde_json::from_slice(content).ok()?;
+    manifest
+        .descriptors()
+        .find(|descriptor| descriptor.digest == subject_digest)
+        .and_then(|descriptor| descriptor.media_type)
+}
+
+fn bundle_needs_attestation_extras(
+    bundle: Option<&OciBundleRecord>,
+    extras: Option<&Vec<OciDescriptor>>,
+) -> bool {
+    let Some(bundle) = bundle else {
+        return false;
+    };
+    let Some(extras) = extras else {
+        return false;
+    };
+    extras.iter().any(|extra| {
+        !bundle
+            .objects
+            .iter()
+            .any(|object| object.digest == extra.digest)
+    })
 }
 
 #[derive(Deserialize)]
@@ -776,9 +965,9 @@ fn digest_sha256_bytes(digest: &str) -> Result<[u8; 32], AppError> {
 #[cfg(test)]
 mod tests {
     use super::{OciRegistry, is_valid_repository_name};
-    use crate::metadata::FilesystemMetadataStore;
     #[cfg(feature = "surrealdb")]
     use crate::metadata::SurrealMetadataStore;
+    use crate::metadata::{FilesystemMetadataStore, MetadataStore};
     use crate::object_store::FilesystemObjectStore;
     use crate::package::UploadPackage;
     use crate::repository::PackageRepository;
@@ -861,6 +1050,103 @@ mod tests {
         assert_eq!(
             read.media_type,
             "application/vnd.oci.image.manifest.v1+json"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_attestation_manifest_is_added_to_subject_bundle() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let metadata = Arc::new(FilesystemMetadataStore::new(
+            tempdir.path().join("metadata"),
+        ));
+        let objects = Arc::new(FilesystemObjectStore::new(tempdir.path().join("objects")));
+        let registry = OciRegistry::new(metadata.clone(), objects);
+        let layer = b"layer";
+        let layer_digest = format!("sha256:{}", hex::encode(Sha256::digest(layer)));
+        let attestation_blob = b"attestation";
+        let attestation_blob_digest =
+            format!("sha256:{}", hex::encode(Sha256::digest(attestation_blob)));
+
+        registry
+            .store_blob("team/image", &layer_digest, layer.as_slice().into())
+            .await
+            .unwrap();
+        registry
+            .store_blob(
+                "team/image",
+                &attestation_blob_digest,
+                attestation_blob.as_slice().into(),
+            )
+            .await
+            .unwrap();
+
+        let subject_manifest = format!(
+            r#"{{"schemaVersion":2,"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{layer_digest}","size":{}}}]}}"#,
+            layer.len()
+        );
+        let subject = registry
+            .store_manifest(
+                "team/image",
+                "sha256-subject",
+                "application/vnd.oci.image.manifest.v1+json",
+                subject_manifest.into(),
+            )
+            .await
+            .unwrap();
+        let attestation_manifest = format!(
+            r#"{{"schemaVersion":2,"layers":[{{"mediaType":"application/vnd.in-toto+json","digest":"{attestation_blob_digest}","size":{}}}]}}"#,
+            attestation_blob.len()
+        );
+        let attestation_digest = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(attestation_manifest.as_bytes()))
+        );
+        let attestation = registry
+            .store_manifest(
+                "team/image",
+                &attestation_digest,
+                "application/vnd.oci.image.manifest.v1+json",
+                attestation_manifest.into(),
+            )
+            .await
+            .unwrap();
+        let index = format!(
+            r#"{{"schemaVersion":2,"manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{}","size":{}}},{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{}","size":{},"platform":{{"architecture":"unknown","os":"unknown"}},"annotations":{{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":"{}"}}}}]}}"#,
+            subject.digest,
+            subject.content.len(),
+            attestation.digest,
+            attestation.content.len(),
+            subject.digest
+        );
+        registry
+            .store_manifest(
+                "team/image",
+                "latest",
+                "application/vnd.oci.image.index.v1+json",
+                index.into(),
+            )
+            .await
+            .unwrap();
+
+        let bundle = metadata.oci_bundle(&subject.digest).await.unwrap();
+        assert!(
+            bundle
+                .objects
+                .iter()
+                .any(|object| object.digest == layer_digest)
+        );
+        assert!(
+            bundle
+                .objects
+                .iter()
+                .any(|object| object.digest == attestation.digest && object.kind == "manifest")
+        );
+        assert!(
+            bundle
+                .objects
+                .iter()
+                .any(|object| object.digest == attestation_blob_digest
+                    && object.size == attestation_blob.len() as u64)
         );
     }
 

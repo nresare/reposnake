@@ -6,7 +6,6 @@ use crate::package::is_valid_project_name;
 use anyhow::Context;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -22,23 +21,11 @@ pub struct Config {
     pub metadata_store: MetadataStoreConfig,
     #[serde(default)]
     pub object_store: ObjectStoreConfig,
-    #[serde(rename = "identity-provider", default)]
-    pub identity_providers: Vec<IdentityProviderConfig>,
+    #[serde(rename = "role", default)]
+    pub roles: Vec<authzoo::RoleConfig>,
     #[serde(rename = "publisher", default)]
     pub publishers: Vec<PublisherConfig>,
     pub admin: Option<AdminConfig>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct IdentityProviderConfig {
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub audience: String,
-    #[serde(default)]
-    pub issuer: String,
-    pub validation_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -47,11 +34,7 @@ pub struct PublisherConfig {
     #[serde(default)]
     pub name: String,
     pub projects: Vec<String>,
-    #[serde(rename = "identity-provider")]
-    pub identity_provider: Option<String>,
-    #[serde(default)]
-    #[serde(rename = "required-claims")]
-    pub required_claims: BTreeMap<String, String>,
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,7 +44,7 @@ pub struct AdminConfig {
     pub identity_provider: Option<String>,
     #[serde(default)]
     #[serde(rename = "required-claims")]
-    pub required_claims: BTreeMap<String, String>,
+    pub required_claims: BTreeMap<String, authzoo::ClaimRequirement>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,48 +122,26 @@ impl Config {
         }
         self.metadata_store.validate()?;
         self.object_store.validate()?;
+        let role_validator = authzoo::TokenValidator::new(self.roles.clone())?;
         if !disable_auth {
-            if self.identity_providers.is_empty() {
-                anyhow::bail!("at least one [[identity-provider]] entry is required");
+            if self.roles.is_empty() {
+                anyhow::bail!("at least one [[role]] entry is required");
             }
             if self.publishers.is_empty() {
                 anyhow::bail!("at least one [[publisher]] entry is required");
             }
         }
 
-        let mut identity_provider_names = HashSet::new();
-        for identity_provider in &self.identity_providers {
-            identity_provider.validate()?;
-            if !identity_provider_names.insert(identity_provider.name.clone()) {
-                anyhow::bail!("duplicate identity-provider '{}'", identity_provider.name);
-            }
-        }
-
         for publisher in &self.publishers {
             if !disable_auth {
                 let publisher_name = publisher.display_name();
-                let identity_provider =
-                    publisher.identity_provider.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "publisher '{publisher_name}' must define identity-provider"
-                        )
-                    })?;
-                if identity_provider.is_empty() {
-                    anyhow::bail!(
-                        "publisher '{publisher_name}' identity-provider must not be empty"
-                    );
+                let role = publisher.role.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("publisher '{publisher_name}' must define role")
+                })?;
+                if role.is_empty() {
+                    anyhow::bail!("publisher '{publisher_name}' role must not be empty");
                 }
-                if !identity_provider_names.contains(identity_provider) {
-                    anyhow::bail!(
-                        "publisher '{publisher_name}' references unknown identity-provider '{identity_provider}'"
-                    );
-                }
-            }
-            if !disable_auth && publisher.required_claims.is_empty() {
-                let publisher_name = publisher.display_name();
-                anyhow::bail!(
-                    "publisher '{publisher_name}' must define at least one required_claim"
-                );
+                role_validator.ensure_roles_exist([role])?;
             }
             if publisher.projects.is_empty() {
                 let publisher_name = publisher.display_name();
@@ -209,8 +170,23 @@ impl Config {
             if identity_provider.is_empty() {
                 anyhow::bail!("admin identity-provider must not be empty");
             }
-            if !identity_provider_names.contains(identity_provider) {
-                anyhow::bail!("admin references unknown identity-provider '{identity_provider}'");
+            role_validator.ensure_roles_exist([identity_provider])?;
+            let admin_role = role_validator
+                .roles()
+                .get(identity_provider)
+                .expect("admin role existence was checked");
+            for (claim, requirement) in &admin.required_claims {
+                if claim.is_empty() {
+                    anyhow::bail!("admin required-claims must not contain an empty claim name");
+                }
+                requirement.validate("admin", claim)?;
+                if let Some(role_requirement) = admin_role.claims.get(claim)
+                    && role_requirement != requirement
+                {
+                    anyhow::bail!(
+                        "admin required-claims duplicates role claim '{claim}' with a different requirement"
+                    );
+                }
             }
         }
 
@@ -365,32 +341,6 @@ impl IdmouseConfig {
     }
 }
 
-impl IdentityProviderConfig {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        if self.name.is_empty() {
-            anyhow::bail!("identity-provider names must not be empty");
-        }
-        if self.audience.is_empty() {
-            anyhow::bail!(
-                "identity-provider '{}' audience must not be empty",
-                self.name
-            );
-        }
-        if self.issuer.is_empty() {
-            anyhow::bail!("identity-provider '{}' issuer must not be empty", self.name);
-        }
-        match self.validation_key.as_deref() {
-            Some(validation_key) if !validation_key.is_empty() => {}
-            None => {}
-            _ => anyhow::bail!(
-                "identity-provider '{}' validation-key must not be empty",
-                self.name
-            ),
-        }
-        Ok(())
-    }
-}
-
 impl PublisherConfig {
     pub fn display_name(&self) -> &str {
         if self.name.is_empty() {
@@ -441,19 +391,20 @@ mod tests {
             r#"
 origin = "http://localhost:8080"
 
-[[identity-provider]]
+[[role]]
 name = "buildkite"
 audience = "reposnake"
 issuer = "https://issuer.example"
 validation-key = "shared-secret"
+algorithms = ["HS256"]
+
+[role.claims]
+sub = "buildkite:deploy"
 
 [[publisher]]
 name = "ci"
 projects = ["reposnake-demo", "other_demo"]
-identity-provider = "buildkite"
-
-[publisher.required-claims]
-sub = "buildkite:deploy"
+role = "buildkite"
 "#,
         )
         .unwrap();
@@ -463,7 +414,7 @@ sub = "buildkite:deploy"
         assert_eq!(config.origin, "http://localhost:8080");
         assert_eq!(config.max_upload_bytes, 100 * 1024 * 1024);
         assert_eq!(config.metadata_store.uri, "mem://");
-        assert_eq!(config.identity_providers[0].name, "buildkite");
+        assert_eq!(config.roles[0].name, "buildkite");
         assert_eq!(config.object_store.backend, ObjectStoreBackend::Filesystem);
         assert_eq!(
             config.object_store.directory.as_deref(),
@@ -477,7 +428,7 @@ sub = "buildkite:deploy"
             r#"
 origin = "http://localhost:8080"
 
-[[identity-provider]]
+[[role]]
 name = "buildkite"
 audience = "reposnake"
 issuer = "https://issuer.example"
@@ -492,10 +443,7 @@ pipeline = "maintenance"
 [[publisher]]
 name = "ci"
 projects = ["reposnake-demo"]
-identity-provider = "buildkite"
-
-[publisher.required-claims]
-pipeline = "ci"
+role = "buildkite"
 "#,
         )
         .unwrap();
@@ -504,18 +452,21 @@ pipeline = "ci"
         let admin = config.admin.as_ref().unwrap();
         assert_eq!(admin.identity_provider.as_deref(), Some("buildkite"));
         assert_eq!(
-            admin.required_claims.get("pipeline").map(String::as_str),
-            Some("maintenance")
+            admin
+                .required_claims
+                .get("pipeline")
+                .map(|requirement| requirement.matches(Some("maintenance"))),
+            Some(true)
         );
     }
 
     #[test]
-    fn rejects_admin_with_unknown_identity_provider() {
+    fn rejects_admin_with_unknown_role() {
         let config: Config = toml::from_str(
             r#"
 origin = "http://localhost:8080"
 
-[[identity-provider]]
+[[role]]
 name = "buildkite"
 audience = "reposnake"
 issuer = "https://issuer.example"
@@ -527,10 +478,7 @@ identity-provider = "other"
 [[publisher]]
 name = "ci"
 projects = ["reposnake-demo"]
-identity-provider = "buildkite"
-
-[publisher.required-claims]
-pipeline = "ci"
+role = "buildkite"
 "#,
         )
         .unwrap();
@@ -675,7 +623,7 @@ url = "http://localhost:9000/token"
 token_path = "/run/secrets/idmouse-bearer-token"
 "#,
             r#"
-[[identity-provider]]
+[[role]]
 name = "buildkite"
 audience = "reposnake"
 issuer = "https://issuer.example"
@@ -968,7 +916,7 @@ projects = ["*"]
     }
 
     #[test]
-    fn disable_auth_skips_authentication_and_required_claims_validation() {
+    fn disable_auth_skips_role_validation() {
         let config: Config = toml::from_str(
             r#"
 origin = "http://localhost:8080"
@@ -983,25 +931,19 @@ projects = ["*"]
     }
 
     #[test]
-    fn rejects_missing_identity_provider_when_auth_is_enabled() {
+    fn rejects_missing_role_when_auth_is_enabled() {
         let config: Config = toml::from_str(
             r#"
 origin = "http://localhost:8080"
 
 [[publisher]]
 projects = ["*"]
-
-[publisher.required-claims]
-sub = "buildkite:deploy"
 "#,
         )
         .unwrap();
 
         let error = config.validate(false).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "at least one [[identity-provider]] entry is required"
-        );
+        assert_eq!(error.to_string(), "at least one [[role]] entry is required");
     }
 
     #[test]
@@ -1010,7 +952,7 @@ sub = "buildkite:deploy"
             r#"
 origin = "http://localhost:8080"
 
-[[identity-provider]]
+[[role]]
 name = "buildkite"
 audience = "reposnake"
 issuer = "https://issuer.example"
@@ -1031,17 +973,17 @@ issuer = "https://issuer.example"
             r#"
 origin = "http://localhost:8080"
 
-[[identity-provider]]
+[[role]]
 name = "buildkite"
 audience = "reposnake"
 issuer = "https://issuer.example"
 
+[role.claims]
+sub = "buildkite:deploy"
+
 [[publisher]]
 projects = ["*"]
-identity-provider = "buildkite"
-
-[publisher.required-claims]
-sub = "buildkite:deploy"
+role = "buildkite"
 "#,
         )
         .unwrap();
@@ -1055,49 +997,49 @@ sub = "buildkite:deploy"
             r#"
 origin = "http://localhost:8080"
 
+[[role]]
+name = "buildkite"
+audience = "reposnake"
+issuer = "https://issuer.example"
+
+[role.claims]
+repository_owner = "example"
+
 [[publisher]]
 projects = ["*"]
-
-[publisher.required-claims]
-repository_owner = "example"
+role = "buildkite"
 "#,
         )
         .unwrap();
 
         assert_eq!(
-            config.publishers[0]
-                .required_claims
+            config.roles[0]
+                .claims
                 .get("repository_owner")
-                .map(String::as_str),
-            Some("example")
+                .map(|requirement| requirement.matches(Some("example"))),
+            Some(true)
         );
     }
 
     #[test]
-    fn rejects_publisher_with_unknown_identity_provider() {
+    fn rejects_publisher_with_unknown_role() {
         let config: Config = toml::from_str(
             r#"
 origin = "http://localhost:8080"
 
-[[identity-provider]]
+[[role]]
 name = "kubernetes"
 audience = "reposnake"
 issuer = "https://kubernetes.default.svc"
 
 [[publisher]]
 projects = ["*"]
-identity-provider = "buildkite"
-
-[publisher.required-claims]
-sub = "buildkite:deploy"
+role = "buildkite"
 "#,
         )
         .unwrap();
 
         let error = config.validate(false).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "publisher '<unnamed>' references unknown identity-provider 'buildkite'"
-        );
+        assert_eq!(error.to_string(), "unknown role 'buildkite'");
     }
 }

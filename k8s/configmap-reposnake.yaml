@@ -13,7 +13,7 @@ data:
     [metadata-store]
     uri = "mem://"
 
-    [[identity-provider]]
+    [[role]]
     name = "kubernetes"
     audience = "reposnake"
     issuer = "https://issuer.example"
@@ -26,10 +26,11 @@ data:
     -----END PUBLIC KEY-----
     """
 
+    [role.claims]
+    sub = "system:serviceaccount:build:publisher"
+    repository = "example-package"
+
     [[publisher]]
     name = "ci"
     projects = ["example-package"]
-
-    [publisher.required-claims]
-    sub = "system:serviceaccount:build:publisher"
-    repository = "example-package"
+    role = "kubernetes"

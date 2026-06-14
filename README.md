@@ -38,7 +38,7 @@ uri = "mem://"
 # url = "http://idmouse.example/token"
 # token-path = "/run/secrets/idmouse-bearer-token"
 
-[[identity-provider]]
+[[role]]
 name = "kubernetes"
 audience = "reposnake"
 issuer = "https://issuer.example"
@@ -51,14 +51,14 @@ validation-key = """
 -----END PUBLIC KEY-----
 """
 
+[role.claims]
+sub = "system:serviceaccount:build:publisher"
+repository = "example-package"
+
 [[publisher]]
 name = "ci"
 projects = ["example-package", "other_package"]
-identity-provider = "kubernetes"
-
-[publisher.required-claims]
-sub = "system:serviceaccount:build:publisher"
-repository = "example-package"
+role = "kubernetes"
 ```
 
 An IPv4-any or IPv4-loopback `bind-address`, such as `0.0.0.0:8080` or `127.0.0.1:8080`, listens on both IPv4 and IPv6 when IPv6 is available.
@@ -127,7 +127,7 @@ When a Docker-compatible client starts a push without credentials, reposnake ret
 challenge pointing at `/v2/token`. The token endpoint validates the JWT supplied through Basic
 or Bearer authentication and returns that same JWT as the registry bearer token.
 
-For local testing, authentication and publisher policy checks can be bypassed:
+For local testing, authentication and publisher role checks can be bypassed:
 
 ```sh
 cargo run -- --config-file reposnake.toml.example --disable-auth
@@ -155,4 +155,3 @@ directory = "/data/metadata"
 ## License
 
 MIT
-

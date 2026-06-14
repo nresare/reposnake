@@ -1968,11 +1968,34 @@ mod tests {
             config.len()
         );
         let first_digest = store_raw_object(object_store.as_ref(), first_manifest.as_bytes()).await;
+        let attestation_blob = b"attestation data";
+        let attestation_blob_digest =
+            store_raw_object(object_store.as_ref(), attestation_blob).await;
+        let attestation_manifest = format!(
+            r#"{{"schemaVersion":2,"layers":[{{"mediaType":"application/vnd.in-toto+json","digest":"{attestation_blob_digest}","size":{}}}]}}"#,
+            attestation_blob.len()
+        );
+        let attestation_digest =
+            store_raw_object(object_store.as_ref(), attestation_manifest.as_bytes()).await;
+        let index_manifest = format!(
+            r#"{{"schemaVersion":2,"manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{first_digest}","size":{}}},{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{attestation_digest}","size":{},"platform":{{"architecture":"unknown","os":"unknown"}},"annotations":{{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":"{first_digest}"}}}}]}}"#,
+            first_manifest.len(),
+            attestation_manifest.len()
+        );
+        let index_digest = store_raw_object(object_store.as_ref(), index_manifest.as_bytes()).await;
         metadata
             .store_oci_manifest(OciManifestRecord {
                 repository: "team/image".to_string(),
                 digest: first_digest.clone(),
                 media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            })
+            .await
+            .unwrap();
+        metadata
+            .store_oci_manifest(OciManifestRecord {
+                repository: "team/image".to_string(),
+                digest: index_digest.clone(),
+                media_type: "application/vnd.oci.image.index.v1+json".to_string(),
             })
             .await
             .unwrap();
@@ -2008,7 +2031,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["converted"], 1);
         assert_eq!(body["failed"], 0);
-        assert_eq!(body["remaining"], 1);
+        assert_eq!(body["remaining"], 2);
 
         let response = app
             .oneshot(
@@ -2026,10 +2049,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["converted"], 1);
+        assert_eq!(body["converted"], 2);
         assert_eq!(body["failed"], 0);
         assert_eq!(body["remaining"], 0);
-        assert_eq!(metadata.list_oci_bundles().await.unwrap().len(), 2);
+        assert_eq!(metadata.list_oci_bundles().await.unwrap().len(), 3);
         assert!(
             metadata
                 .oci_bundle(&first_digest)
@@ -2044,6 +2067,20 @@ mod tests {
         assert_eq!(
             metadata.oci_bundle(&first_digest).await.unwrap().created,
             Some("2026-06-14T08:50:55Z".parse().unwrap())
+        );
+        let first_bundle = metadata.oci_bundle(&first_digest).await.unwrap();
+        assert!(
+            first_bundle
+                .objects
+                .iter()
+                .any(|object| object.digest == attestation_digest && object.kind == "manifest")
+        );
+        assert!(
+            first_bundle
+                .objects
+                .iter()
+                .any(|object| object.digest == attestation_blob_digest
+                    && object.size == attestation_blob.len() as u64)
         );
         assert!(metadata.oci_bundle(&second_digest).await.is_ok());
     }

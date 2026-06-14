@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: The reposnake contributors
 
 use crate::auth;
-use crate::config::{Config, IdentityProviderConfig, PublisherConfig};
+use crate::config::{AdminConfig, Config, IdentityProviderConfig, PublisherConfig};
 use crate::embed::StaticFile;
 use crate::error::AppError;
 use crate::oci::{DOCKER_DISTRIBUTION_API_VERSION, OciRegistry};
@@ -18,7 +18,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use jsonwebtoken::{Validation, decode};
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,7 @@ pub struct AppState {
     pub oci_registry: OciRegistry,
     pub subject_validator: SubjectValidator,
     pub publishers: Arc<Vec<PublisherConfig>>,
+    pub admin: Option<AdminConfig>,
     pub max_upload_bytes: usize,
     pub templates: Templates,
     pub origin: String,
@@ -52,6 +53,7 @@ pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Res
         repository,
         subject_validator: SubjectValidator::new(config.identity_providers.clone(), disable_auth),
         publishers: Arc::new(config.publishers.clone()),
+        admin: config.admin.clone(),
         max_upload_bytes: config.max_upload_bytes,
         templates: Templates::new()?,
         origin: config.origin.clone(),
@@ -82,6 +84,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/-/utilization", get(utilization_dashboard))
         .route("/-/utilisation", get(utilization_dashboard))
+        .route(
+            "/-/admin/oci-metadata-migration",
+            post(migrate_oci_metadata),
+        )
         .route("/static/{*path}", get(static_file))
         .route("/packages/{project}/{filename}", get(download_package))
         .route("/{project}", get(simple_project_redirect))
@@ -118,6 +124,28 @@ async fn utilization_dashboard(State(state): State<AppState>) -> Result<Response
         .map_err(|error| {
             AppError::Internal(format!("failed to build utilization response: {error}"))
         })
+}
+
+async fn migrate_oci_metadata(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<crate::oci::OciMetadataMigrationReport>, AppError> {
+    state.authorize_admin(&headers)?;
+    let request = if body.is_empty() {
+        OciMetadataMigrationRequest { limit: None }
+    } else {
+        serde_json::from_slice(&body).map_err(|error| {
+            AppError::BadRequest(format!("failed to decode migration request: {error}"))
+        })?
+    };
+    let limit = request.limit.unwrap_or(100).min(1000);
+    Ok(Json(state.oci_registry.migrate_metadata(limit).await?))
+}
+
+#[derive(Deserialize)]
+struct OciMetadataMigrationRequest {
+    limit: Option<usize>,
 }
 
 async fn oci_api_version_check(method: Method) -> Result<Response, AppError> {
@@ -619,6 +647,41 @@ async fn upload_distribution(
 }
 
 impl AppState {
+    fn authorize_admin(&self, headers: &HeaderMap) -> Result<(), AppError> {
+        if !self.subject_validator.auth_enabled() {
+            debug!("admin authorization skipped because auth is disabled");
+            return Ok(());
+        }
+
+        let Some(admin) = &self.admin else {
+            return Err(AppError::NotFound(
+                "admin endpoints are not configured".to_string(),
+            ));
+        };
+        let bearer_token = auth::extract_upload_token(headers)?;
+        let claims = self.subject_validator.validate(Some(&bearer_token))?;
+        if !claims.matches_identity_provider(admin.identity_provider.as_deref()) {
+            return Err(AppError::Forbidden(
+                "token was not issued by the configured admin identity provider".to_string(),
+            ));
+        }
+        if let Some((claim_name, required_value)) =
+            claims.first_missing_required_claim(&admin.required_claims)
+        {
+            debug!(
+                claim_name,
+                required_value,
+                subject = %claims.subject(),
+                "admin policy did not match token claims"
+            );
+            return Err(AppError::Forbidden(
+                "token claims do not satisfy the admin policy".to_string(),
+            ));
+        }
+        debug!(subject = %claims.subject(), "admin authorization check passed");
+        Ok(())
+    }
+
     fn authorize_upload(
         &self,
         normalized_project: &str,
@@ -1494,7 +1557,8 @@ impl ProjectFileJson {
 #[cfg(test)]
 mod tests {
     use super::{AppState, SubjectValidator, build_router};
-    use crate::config::{IdentityProviderConfig, PublisherConfig};
+    use crate::config::{AdminConfig, IdentityProviderConfig, PublisherConfig};
+    use crate::metadata::OciManifestRecord;
     use crate::oci::OciRegistry;
     use crate::package::SIMPLE_API_VERSION;
     use crate::repository::PackageRepository;
@@ -1885,6 +1949,119 @@ mod tests {
                     && object.kind == "manifest"
                     && object.size == 123)
         );
+    }
+
+    #[tokio::test]
+    async fn admin_endpoint_migrates_old_oci_metadata_in_limited_batches() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = admin_state(tempdir.path()).await;
+        let metadata = state.repository.metadata_store();
+        let object_store = state.repository.object_store();
+        let app = build_router(state);
+        let token = test_token("builder", "ci");
+        let layer_digest = format!("sha256:{}", sha256(b"referenced layer"));
+
+        let first_manifest = format!(
+            r#"{{"schemaVersion":2,"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{layer_digest}","size":16}}]}}"#
+        );
+        let first_digest = store_raw_object(object_store.as_ref(), first_manifest.as_bytes()).await;
+        metadata
+            .store_oci_manifest(OciManifestRecord {
+                repository: "team/image".to_string(),
+                digest: first_digest.clone(),
+                media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let second_manifest = r#"{"schemaVersion":2,"layers":[]}"#;
+        let second_digest =
+            store_raw_object(object_store.as_ref(), second_manifest.as_bytes()).await;
+        metadata
+            .store_oci_manifest(OciManifestRecord {
+                repository: "team/worker".to_string(),
+                digest: second_digest.clone(),
+                media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/-/admin/oci-metadata-migration")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"limit":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["converted"], 1);
+        assert_eq!(body["failed"], 0);
+        assert_eq!(body["remaining"], 1);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/-/admin/oci-metadata-migration")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"limit":100}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["converted"], 1);
+        assert_eq!(body["failed"], 0);
+        assert_eq!(body["remaining"], 0);
+        assert_eq!(metadata.list_oci_bundles().await.unwrap().len(), 2);
+        assert!(
+            metadata
+                .oci_bundle(&first_digest)
+                .await
+                .unwrap()
+                .objects
+                .iter()
+                .any(|object| object.digest == layer_digest
+                    && object.size == 16
+                    && object.kind == "layer")
+        );
+        assert!(metadata.oci_bundle(&second_digest).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn admin_endpoint_is_not_found_without_admin_config() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let state = authenticated_state(tempdir.path()).await;
+        let app = build_router(state);
+        let token = test_token("builder", "ci");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/-/admin/oci-metadata-migration")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"limit":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2377,6 +2554,7 @@ mod tests {
             repository,
             subject_validator: SubjectValidator::new(Vec::new(), true),
             publishers: Arc::new(Vec::new()),
+            admin: None,
             max_upload_bytes: 1024 * 1024,
             templates: Templates::new().unwrap(),
             origin: "https://packages.example".to_string(),
@@ -2407,10 +2585,20 @@ mod tests {
                 identity_provider: Some("buildkite".to_string()),
                 required_claims: BTreeMap::from([("pipeline".to_string(), "ci".to_string())]),
             }]),
+            admin: None,
             max_upload_bytes: 1024 * 1024,
             templates: Templates::new().unwrap(),
             origin: "https://packages.example".to_string(),
         }
+    }
+
+    async fn admin_state(path: &std::path::Path) -> AppState {
+        let mut state = authenticated_state(path).await;
+        state.admin = Some(AdminConfig {
+            identity_provider: Some("buildkite".to_string()),
+            required_claims: BTreeMap::from([("pipeline".to_string(), "ci".to_string())]),
+        });
+        state
     }
 
     fn multipart_upload_body(name: &str, version: &str, content: &[u8]) -> Vec<u8> {
@@ -2484,6 +2672,15 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(content);
         hex::encode(hasher.finalize())
+    }
+
+    async fn store_raw_object(
+        store: &dyn crate::object_store::ObjectStore,
+        content: &[u8],
+    ) -> String {
+        let mut writer = store.create_writer().await.unwrap();
+        writer.write_chunk(content).await.unwrap();
+        format!("sha256:{}", hex::encode(writer.commit().await.unwrap()))
     }
 
     #[derive(Serialize)]

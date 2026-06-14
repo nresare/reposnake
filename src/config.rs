@@ -5,6 +5,8 @@ use crate::oci::is_valid_repository_name;
 use crate::package::is_valid_project_name;
 use anyhow::Context;
 use serde::Deserialize;
+use serde::de::{self, Visitor};
+use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -20,6 +22,8 @@ pub struct Config {
     pub metadata_store: MetadataStoreConfig,
     #[serde(default)]
     pub object_store: ObjectStoreConfig,
+    #[serde(default)]
+    pub cache: ObjectCacheConfig,
     #[serde(rename = "role", default)]
     pub roles: Vec<authzoo::RoleConfig>,
     #[serde(rename = "publisher", default)]
@@ -91,6 +95,25 @@ pub struct ObjectStoreConfig {
     pub bucket: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ObjectCacheConfig {
+    #[serde(default = "default_object_cache_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_object_cache_directory")]
+    pub directory: PathBuf,
+    #[serde(
+        default = "default_object_cache_max_file_size",
+        deserialize_with = "deserialize_byte_size"
+    )]
+    pub max_file_size: u64,
+    #[serde(
+        default = "default_object_cache_max_total_size",
+        deserialize_with = "deserialize_byte_size"
+    )]
+    pub max_total_size: u64,
+}
+
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -111,6 +134,7 @@ impl Config {
         }
         self.metadata_store.validate()?;
         self.object_store.validate()?;
+        self.cache.validate()?;
         let role_validator = authzoo::TokenValidator::new(self.roles.clone())?;
         if !disable_auth {
             if self.roles.is_empty() {
@@ -190,6 +214,17 @@ impl Default for ObjectStoreConfig {
     }
 }
 
+impl Default for ObjectCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_object_cache_enabled(),
+            directory: default_object_cache_directory(),
+            max_file_size: default_object_cache_max_file_size(),
+            max_total_size: default_object_cache_max_total_size(),
+        }
+    }
+}
+
 impl ObjectStoreConfig {
     pub fn directory_or_default(&self) -> PathBuf {
         self.directory
@@ -225,6 +260,21 @@ impl ObjectStoreConfig {
                 Ok(())
             }
         }
+    }
+}
+
+impl ObjectCacheConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.directory.as_os_str().is_empty() {
+            anyhow::bail!("cache.directory must not be empty");
+        }
+        if self.max_file_size == 0 {
+            anyhow::bail!("cache.max-file-size must be greater than 0");
+        }
+        if self.max_total_size == 0 {
+            anyhow::bail!("cache.max-total-size must be greater than 0");
+        }
+        Ok(())
     }
 }
 
@@ -327,6 +377,22 @@ fn default_object_store_directory() -> PathBuf {
     "/data".into()
 }
 
+fn default_object_cache_enabled() -> bool {
+    true
+}
+
+fn default_object_cache_directory() -> PathBuf {
+    "/var/lib/reposnake-cache".into()
+}
+
+fn default_object_cache_max_file_size() -> u64 {
+    200 * 1024
+}
+
+fn default_object_cache_max_total_size() -> u64 {
+    1024 * 1024 * 1024
+}
+
 fn default_metadata_store_directory() -> PathBuf {
     "/data/metadata".into()
 }
@@ -345,6 +411,67 @@ fn read_secret_file(path: &Path) -> anyhow::Result<String> {
     let len = secret.trim_end_matches(['\r', '\n']).len();
     secret.truncate(len);
     Ok(secret)
+}
+
+fn deserialize_byte_size<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ByteSizeVisitor;
+
+    impl Visitor<'_> for ByteSizeVisitor {
+        type Value = u64;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a byte count integer or a string like \"200KiB\"")
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(value)
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            u64::try_from(value).map_err(|_| E::custom("byte size must not be negative"))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            parse_byte_size(value).map_err(E::custom)
+        }
+    }
+
+    deserializer.deserialize_any(ByteSizeVisitor)
+}
+
+fn parse_byte_size(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    let digit_len = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    if digit_len == 0 {
+        return Err("byte size must start with a number".to_string());
+    }
+    let number = value[..digit_len]
+        .parse::<u64>()
+        .map_err(|error| format!("invalid byte size number: {error}"))?;
+    let unit = value[digit_len..].trim();
+    let multiplier = match unit {
+        "" | "B" => 1,
+        "KiB" => 1024,
+        "MiB" => 1024 * 1024,
+        "GiB" => 1024 * 1024 * 1024,
+        _ => {
+            return Err("byte size unit must be one of B, KiB, MiB, GiB, or omitted".to_string());
+        }
+    };
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| "byte size is too large".to_string())
 }
 
 #[cfg(test)]
@@ -388,6 +515,70 @@ role = "buildkite"
             config.object_store.directory.as_deref(),
             Some(Path::new("/data"))
         );
+        assert!(config.cache.enabled);
+        assert_eq!(
+            config.cache.directory.as_path(),
+            Path::new("/var/lib/reposnake-cache")
+        );
+        assert_eq!(config.cache.max_file_size, 200 * 1024);
+        assert_eq!(config.cache.max_total_size, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parses_cache_config() {
+        let config: Config = toml::from_str(
+            r#"
+origin = "http://localhost:8080"
+
+[cache]
+enabled = false
+directory = "/tmp/reposnake-cache"
+max-file-size = "100KiB"
+max-total-size = "2GiB"
+
+[[publisher]]
+projects = ["*"]
+"#,
+        )
+        .unwrap();
+
+        config.validate(true).unwrap();
+        assert!(!config.cache.enabled);
+        assert_eq!(
+            config.cache.directory.as_path(),
+            Path::new("/tmp/reposnake-cache")
+        );
+        assert_eq!(config.cache.max_file_size, 100 * 1024);
+        assert_eq!(config.cache.max_total_size, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn rejects_invalid_cache_config() {
+        for config in [
+            r#"
+origin = "http://localhost:8080"
+
+[cache]
+directory = ""
+"#,
+            r#"
+origin = "http://localhost:8080"
+
+[cache]
+max-file-size = 0
+"#,
+            r#"
+origin = "http://localhost:8080"
+
+[cache]
+max-total-size = "1GB"
+"#,
+        ] {
+            let config = toml::from_str::<Config>(config);
+            if let Ok(config) = config {
+                assert!(config.validate(true).is_err());
+            }
+        }
     }
 
     #[test]

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: The reposnake contributors
 
-use crate::config::{ObjectStoreBackend, ObjectStoreConfig};
+use crate::config::{ObjectCacheConfig, ObjectStoreBackend, ObjectStoreConfig};
 use crate::error::AppError;
 use anyhow::Context;
 use async_trait::async_trait;
+use filetime::FileTime;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 
@@ -29,6 +31,13 @@ pub struct ObjectMigrationStats {
 }
 
 pub async fn build_object_store(config: &ObjectStoreConfig) -> anyhow::Result<SharedObjectStore> {
+    build_object_store_with_cache(config, &ObjectCacheConfig::default()).await
+}
+
+pub async fn build_object_store_with_cache(
+    config: &ObjectStoreConfig,
+    cache: &ObjectCacheConfig,
+) -> anyhow::Result<SharedObjectStore> {
     match config.backend {
         ObjectStoreBackend::Filesystem => {
             let directory = config.directory.as_ref().ok_or_else(|| {
@@ -38,7 +47,7 @@ pub async fn build_object_store(config: &ObjectStoreConfig) -> anyhow::Result<Sh
                 directory.join("objects"),
             )))
         }
-        ObjectStoreBackend::S3 => build_s3_object_store(config).await,
+        ObjectStoreBackend::S3 => build_s3_object_store(config, cache).await,
     }
 }
 
@@ -141,20 +150,27 @@ pub async fn migrate_filesystem_objects_to_store(
     Ok(stats)
 }
 
-async fn build_s3_object_store(config: &ObjectStoreConfig) -> anyhow::Result<SharedObjectStore> {
+async fn build_s3_object_store(
+    config: &ObjectStoreConfig,
+    cache: &ObjectCacheConfig,
+) -> anyhow::Result<SharedObjectStore> {
     #[cfg(feature = "s3")]
     {
         let bucket = config
             .bucket
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("object-store.bucket is required when backend is s3"))?;
-        Ok(Arc::new(
-            crate::s3_object_store::S3ObjectStore::from_bucket(bucket).await?,
-        ))
+        let store: SharedObjectStore =
+            Arc::new(crate::s3_object_store::S3ObjectStore::from_bucket(bucket).await?);
+        if cache.enabled {
+            Ok(Arc::new(CachedObjectStore::new(store, cache.clone())))
+        } else {
+            Ok(store)
+        }
     }
     #[cfg(not(feature = "s3"))]
     {
-        let _ = config;
+        let _ = (config, cache);
         anyhow::bail!("object-store.backend = \"s3\" requires the s3 Cargo feature");
     }
 }
@@ -201,6 +217,241 @@ impl FilesystemObjectStore {
     fn temp_path(&self) -> PathBuf {
         self.root
             .join(format!(".reposnake-tmp-{}", next_temp_object_id()))
+    }
+}
+
+#[derive(Debug)]
+struct CachedObjectStore {
+    inner: SharedObjectStore,
+    cache: ObjectDiskCache,
+}
+
+impl CachedObjectStore {
+    fn new(inner: SharedObjectStore, config: ObjectCacheConfig) -> Self {
+        Self {
+            inner,
+            cache: ObjectDiskCache::new(config),
+        }
+    }
+}
+
+#[async_trait]
+impl ObjectStore for CachedObjectStore {
+    async fn read(&self, sha256: &[u8; 32]) -> Result<Vec<u8>, AppError> {
+        if let Some(content) = self.cache.read(sha256).await {
+            return Ok(content);
+        }
+
+        let content = self.inner.read(sha256).await?;
+        self.cache.store(sha256, &content).await;
+        Ok(content)
+    }
+
+    async fn check_availability(&self) -> Result<(), AppError> {
+        self.inner.check_availability().await
+    }
+
+    async fn create_writer(&self) -> Result<Box<dyn ObjectWriter>, AppError> {
+        self.inner.create_writer().await
+    }
+
+    async fn delete_if_exists(&self, sha256: &[u8; 32]) -> Result<(), AppError> {
+        self.inner.delete_if_exists(sha256).await?;
+        self.cache.remove(sha256).await;
+        Ok(())
+    }
+
+    async fn list_objects(&self) -> Result<Vec<ObjectMetadata>, AppError> {
+        self.inner.list_objects().await
+    }
+}
+
+#[derive(Debug)]
+struct ObjectDiskCache {
+    root: PathBuf,
+    max_file_size: u64,
+    max_total_size: u64,
+}
+
+#[derive(Debug)]
+struct CacheEntry {
+    path: PathBuf,
+    size: u64,
+    last_used: SystemTime,
+}
+
+impl ObjectDiskCache {
+    fn new(config: ObjectCacheConfig) -> Self {
+        Self {
+            root: config.directory,
+            max_file_size: config.max_file_size,
+            max_total_size: config.max_total_size,
+        }
+    }
+
+    fn object_path(&self, sha256: &[u8; 32]) -> PathBuf {
+        self.root.join(hex::encode(sha256))
+    }
+
+    fn temp_path(&self) -> PathBuf {
+        self.root
+            .join(format!(".reposnake-cache-tmp-{}", next_temp_object_id()))
+    }
+
+    async fn read(&self, sha256: &[u8; 32]) -> Option<Vec<u8>> {
+        let path = self.object_path(sha256);
+        let content = match tokio::fs::read(&path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    "failed to read cached object: {error}"
+                );
+                return None;
+            }
+        };
+
+        let actual_sha256: [u8; 32] = Sha256::digest(&content).into();
+        if &actual_sha256 != sha256 {
+            warn!(
+                path = %path.display(),
+                expected = %hex::encode(sha256),
+                actual = %hex::encode(actual_sha256),
+                "discarding cached object with mismatched digest"
+            );
+            if let Err(error) = tokio::fs::remove_file(&path).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(path = %path.display(), "failed to remove invalid cached object: {error}");
+            }
+            return None;
+        }
+
+        self.touch(&path).await;
+        Some(content)
+    }
+
+    async fn store(&self, sha256: &[u8; 32], content: &[u8]) {
+        if content.len() as u64 > self.max_file_size {
+            return;
+        }
+
+        if let Err(error) = tokio::fs::create_dir_all(&self.root).await {
+            warn!(
+                directory = %self.root.display(),
+                "failed to create object cache directory: {error}"
+            );
+            return;
+        }
+
+        let temp_path = self.temp_path();
+        if let Err(error) = tokio::fs::write(&temp_path, content).await {
+            warn!(
+                path = %temp_path.display(),
+                "failed to write cached object: {error}"
+            );
+            return;
+        }
+
+        let path = self.object_path(sha256);
+        match tokio::fs::rename(&temp_path, &path).await {
+            Ok(()) => {
+                self.touch(&path).await;
+                self.evict().await;
+            }
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    "failed to commit cached object: {error}"
+                );
+                if let Err(error) = tokio::fs::remove_file(&temp_path).await
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(
+                        path = %temp_path.display(),
+                        "failed to remove temporary cached object: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn remove(&self, sha256: &[u8; 32]) {
+        let path = self.object_path(sha256);
+        if let Err(error) = tokio::fs::remove_file(&path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %path.display(), "failed to remove cached object: {error}");
+        }
+    }
+
+    async fn touch(&self, path: &std::path::Path) {
+        let path = path.to_path_buf();
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || filetime::set_file_mtime(path, FileTime::now()))
+                .await
+                .unwrap_or_else(|error| Err(std::io::Error::other(error)))
+        {
+            warn!("failed to update cached object recency: {error}");
+        }
+    }
+
+    async fn evict(&self) {
+        let mut entries = match self.cache_entries().await {
+            Ok(entries) => entries,
+            Err(error) => {
+                warn!("failed to inspect object cache for eviction: {error}");
+                return;
+            }
+        };
+        let mut total_size = entries.iter().map(|entry| entry.size).sum::<u64>();
+        if total_size <= self.max_total_size {
+            return;
+        }
+
+        entries.sort_by_key(|entry| entry.last_used);
+        for entry in entries {
+            if total_size <= self.max_total_size {
+                break;
+            }
+            match tokio::fs::remove_file(&entry.path).await {
+                Ok(()) => total_size = total_size.saturating_sub(entry.size),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    total_size = total_size.saturating_sub(entry.size);
+                }
+                Err(error) => {
+                    warn!(
+                        path = %entry.path.display(),
+                        "failed to evict cached object: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn cache_entries(&self) -> std::io::Result<Vec<CacheEntry>> {
+        let mut entries = match tokio::fs::read_dir(&self.root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut cache_entries = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            if object_digest_from_filename(&entry.file_name()).is_none() {
+                continue;
+            }
+            let metadata = entry.metadata().await?;
+            if !metadata.is_file() {
+                continue;
+            }
+            cache_entries.push(CacheEntry {
+                path: entry.path(),
+                size: metadata.len(),
+                last_used: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            });
+        }
+        Ok(cache_entries)
     }
 }
 
@@ -413,8 +664,16 @@ fn next_temp_object_id() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilesystemObjectStore, ObjectStore, migrate_filesystem_objects_to_store};
+    use super::{
+        CachedObjectStore, FilesystemObjectStore, ObjectStore, migrate_filesystem_objects_to_store,
+    };
+    use crate::config::ObjectCacheConfig;
+    use crate::error::AppError;
+    use async_trait::async_trait;
     use sha2::{Digest as _, Sha256};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[tokio::test]
     async fn writer_commits_by_content_digest_and_deduplicates() -> anyhow::Result<()> {
@@ -496,6 +755,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_cache_serves_cached_small_object_without_reusing_inner_store()
+    -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let content = b"small-object".to_vec();
+        let digest: [u8; 32] = Sha256::digest(&content).into();
+        let inner = Arc::new(CountingObjectStore::new(digest, content.clone()));
+        let store = CachedObjectStore::new(
+            inner.clone(),
+            ObjectCacheConfig {
+                enabled: true,
+                directory: tempdir.path().to_path_buf(),
+                max_file_size: 200 * 1024,
+                max_total_size: 1024 * 1024,
+            },
+        );
+
+        assert_eq!(store.read(&digest).await?, content);
+        assert_eq!(store.read(&digest).await?, content);
+
+        assert_eq!(inner.read_count(), 1);
+        assert_eq!(
+            tokio::fs::read(tempdir.path().join(hex::encode(digest))).await?,
+            content
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn object_cache_does_not_store_large_objects() -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let content = b"too-large".to_vec();
+        let digest: [u8; 32] = Sha256::digest(&content).into();
+        let inner = Arc::new(CountingObjectStore::new(digest, content.clone()));
+        let store = CachedObjectStore::new(
+            inner.clone(),
+            ObjectCacheConfig {
+                enabled: true,
+                directory: tempdir.path().to_path_buf(),
+                max_file_size: (content.len() - 1) as u64,
+                max_total_size: 1024 * 1024,
+            },
+        );
+
+        assert_eq!(store.read(&digest).await?, content);
+        assert_eq!(store.read(&digest).await?, content);
+
+        assert_eq!(inner.read_count(), 2);
+        assert!(!tokio::fs::try_exists(tempdir.path().join(hex::encode(digest))).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn object_cache_evicts_least_recently_used_object() -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let first = b"first".to_vec();
+        let first_digest: [u8; 32] = Sha256::digest(&first).into();
+        let second = b"second".to_vec();
+        let second_digest: [u8; 32] = Sha256::digest(&second).into();
+        let inner = Arc::new(CountingObjectStore::with_objects([
+            (first_digest, first.clone()),
+            (second_digest, second.clone()),
+        ]));
+        let store = CachedObjectStore::new(
+            inner.clone(),
+            ObjectCacheConfig {
+                enabled: true,
+                directory: tempdir.path().to_path_buf(),
+                max_file_size: 200 * 1024,
+                max_total_size: first.len() as u64 + second.len() as u64 - 1,
+            },
+        );
+
+        assert_eq!(store.read(&first_digest).await?, first);
+        assert_eq!(store.read(&first_digest).await?, first);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(store.read(&second_digest).await?, second);
+
+        assert!(!tokio::fs::try_exists(tempdir.path().join(hex::encode(first_digest))).await?);
+        assert!(tokio::fs::try_exists(tempdir.path().join(hex::encode(second_digest))).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn migrates_filesystem_objects_to_destination_store() -> anyhow::Result<()> {
         let source = tempfile::tempdir()?;
         let destination = tempfile::tempdir()?;
@@ -542,5 +884,57 @@ mod tests {
         assert_eq!(stats.copied, 0);
         assert_eq!(stats.skipped, 0);
         Ok(())
+    }
+
+    #[derive(Debug)]
+    struct CountingObjectStore {
+        objects: Vec<([u8; 32], Vec<u8>)>,
+        reads: AtomicUsize,
+    }
+
+    impl CountingObjectStore {
+        fn new(digest: [u8; 32], content: Vec<u8>) -> Self {
+            Self::with_objects([(digest, content)])
+        }
+
+        fn with_objects(objects: impl IntoIterator<Item = ([u8; 32], Vec<u8>)>) -> Self {
+            Self {
+                objects: objects.into_iter().collect(),
+                reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn read_count(&self) -> usize {
+            self.reads.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CountingObjectStore {
+        async fn read(&self, sha256: &[u8; 32]) -> Result<Vec<u8>, AppError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.objects
+                .iter()
+                .find_map(|(digest, content)| (digest == sha256).then(|| content.clone()))
+                .ok_or_else(|| {
+                    AppError::NotFound(format!("object '{}' not found", hex::encode(sha256)))
+                })
+        }
+
+        async fn check_availability(&self) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        async fn create_writer(&self) -> Result<Box<dyn super::ObjectWriter>, AppError> {
+            Err(AppError::Internal("not implemented".to_string()))
+        }
+
+        async fn delete_if_exists(&self, _sha256: &[u8; 32]) -> Result<(), AppError> {
+            Ok(())
+        }
+
+        async fn list_objects(&self) -> Result<Vec<super::ObjectMetadata>, AppError> {
+            Ok(Vec::new())
+        }
     }
 }

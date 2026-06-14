@@ -21,6 +21,13 @@ directory = "/data"
 # bucket = "reposnake-packages"
 # directory = "/data" # Optional migration source for existing filesystem objects.
 
+# Optional. Caches small objects read from S3.
+# [cache]
+# enabled = true
+# directory = "/var/lib/reposnake-cache"
+# max-file-size = "200KiB"
+# max-total-size = "1GiB"
+
 [metadata-store]
 uri = "mem://"
 

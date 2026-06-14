@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: The reposnake contributors
 
-use crate::config::{MetadataStoreConfig, ObjectStoreBackend, ObjectStoreConfig};
+use crate::config::{
+    MetadataStoreConfig, ObjectCacheConfig, ObjectStoreBackend, ObjectStoreConfig,
+};
 use crate::error::AppError;
 use crate::metadata::{
     FilesystemMetadataStore, OciBundleRecord, SharedMetadataStore, build_metadata_store,
 };
 use crate::object_store::{
-    SharedObjectStore, build_object_store, migrate_filesystem_objects_to_store,
+    SharedObjectStore, build_object_store, build_object_store_with_cache,
+    migrate_filesystem_objects_to_store,
 };
 use crate::package::{
     FileRecord, ProjectIndex, ProjectSummary, UploadPackage, is_safe_filename,
@@ -101,9 +104,10 @@ impl PackageRepository {
     pub async fn from_config(
         metadata_store: &MetadataStoreConfig,
         object_store: &ObjectStoreConfig,
+        cache: &ObjectCacheConfig,
     ) -> anyhow::Result<Self> {
         let metadata = build_metadata_store(metadata_store).await?;
-        let objects = build_object_store(object_store).await?;
+        let objects = build_object_store_with_cache(object_store, cache).await?;
         if object_store.backend == ObjectStoreBackend::S3
             && object_store.bucket.is_some()
             && let Some(directory) = &object_store.directory
@@ -886,10 +890,13 @@ projects = ["*"]
         ))
         .unwrap();
         config.validate(true).unwrap();
-        let repository =
-            PackageRepository::from_config(&config.metadata_store, &config.object_store)
-                .await
-                .unwrap();
+        let repository = PackageRepository::from_config(
+            &config.metadata_store,
+            &config.object_store,
+            &config.cache,
+        )
+        .await
+        .unwrap();
 
         repository
             .store_upload(UploadPackage {
@@ -903,9 +910,13 @@ projects = ["*"]
             })
             .await
             .unwrap();
-        let reopened = PackageRepository::from_config(&config.metadata_store, &config.object_store)
-            .await
-            .unwrap();
+        let reopened = PackageRepository::from_config(
+            &config.metadata_store,
+            &config.object_store,
+            &config.cache,
+        )
+        .await
+        .unwrap();
 
         let project = reopened.project("reposnake-demo").await.unwrap();
         let (content, file) = reopened

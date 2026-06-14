@@ -8,12 +8,14 @@ use crate::metadata::{
 };
 use crate::object_store::SharedObjectStore;
 use axum::body::Bytes;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
 
 pub const DOCKER_DISTRIBUTION_API_VERSION: &str = "registry/2.0";
 static UPLOAD_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -290,6 +292,17 @@ impl OciRegistry {
             .into_iter()
             .map(|bundle| bundle.digest)
             .collect::<BTreeSet<_>>();
+        let tags_by_digest = self
+            .metadata
+            .list_oci_tag_records()
+            .await?
+            .into_iter()
+            .fold(BTreeMap::<String, Vec<String>>::new(), |mut tags, tag| {
+                tags.entry(tag.digest)
+                    .or_default()
+                    .push(format!("{}:{}", tag.repository, tag.tag));
+                tags
+            });
         let mut pending = self
             .metadata
             .list_oci_manifests()
@@ -308,6 +321,12 @@ impl OciRegistry {
                 .then_with(|| left.digest.cmp(&right.digest))
         });
         let initial_pending = pending.len();
+        debug!(
+            limit,
+            pending = initial_pending,
+            existing_bundles = existing_bundles.len(),
+            "starting OCI metadata migration batch"
+        );
 
         let mut converted = 0;
         let mut failed = 0;
@@ -317,12 +336,39 @@ impl OciRegistry {
             match self.migrate_manifest_metadata(&manifest).await {
                 Ok(bundle) => {
                     converted += 1;
+                    let tags = tags_by_digest
+                        .get(&manifest.digest)
+                        .cloned()
+                        .unwrap_or_default();
                     if bundle.status == "incomplete" {
                         incomplete += 1;
                     }
+                    info!(
+                        repository = %manifest.repository,
+                        digest = %bundle.digest,
+                        created = ?bundle.created,
+                        status = %bundle.status,
+                        object_count = bundle.objects.len(),
+                        missing_object_count = bundle.missing_objects.len(),
+                        tag_count = tags.len(),
+                        tags = ?tags,
+                        "converted OCI metadata for manifest"
+                    );
                 }
                 Err(error) => {
                     failed += 1;
+                    let tags = tags_by_digest
+                        .get(&manifest.digest)
+                        .cloned()
+                        .unwrap_or_default();
+                    warn!(
+                        repository = %manifest.repository,
+                        digest = %manifest.digest,
+                        tag_count = tags.len(),
+                        tags = ?tags,
+                        error = %error,
+                        "failed to convert OCI metadata for manifest"
+                    );
                     errors.push(OciMetadataMigrationError {
                         repository: manifest.repository,
                         digest: manifest.digest,
@@ -331,13 +377,21 @@ impl OciRegistry {
                 }
             }
         }
-        Ok(OciMetadataMigrationReport {
+        let report = OciMetadataMigrationReport {
             converted,
             failed,
             remaining: initial_pending.saturating_sub(converted),
             incomplete,
             errors,
-        })
+        };
+        info!(
+            converted = report.converted,
+            failed = report.failed,
+            remaining = report.remaining,
+            incomplete = report.incomplete,
+            "finished OCI metadata migration batch"
+        );
+        Ok(report)
     }
 
     async fn read_upload_state(
@@ -407,12 +461,14 @@ impl OciRegistry {
             ),
         )]);
         let mut missing_objects = BTreeMap::new();
-        self.collect_manifest_objects(content, &mut objects, &mut missing_objects)
+        let mut created = None;
+        self.collect_manifest_objects(content, &mut objects, &mut missing_objects, &mut created)
             .await?;
         Ok(OciBundleRecord {
             digest: digest.to_string(),
             root_manifest_digest: digest.to_string(),
             root_media_type: media_type.to_string(),
+            created,
             status: if missing_objects.is_empty() {
                 "complete".to_string()
             } else {
@@ -428,6 +484,7 @@ impl OciRegistry {
         content: &[u8],
         objects: &mut BTreeMap<String, OciObjectRecord>,
         missing_objects: &mut BTreeMap<String, OciMissingObjectRecord>,
+        created: &mut Option<DateTime<Utc>>,
     ) -> Result<(), AppError> {
         let manifest: OciManifestDocument = serde_json::from_slice(content).map_err(|error| {
             AppError::BadRequest(format!(
@@ -444,7 +501,14 @@ impl OciRegistry {
             objects.entry(descriptor.digest.clone()).or_insert_with(|| {
                 oci_object(&descriptor.digest, descriptor.size, media_type, kind)
             });
-            if matches!(kind, "manifest" | "index") {
+            if kind == "config" {
+                let sha256 = digest_sha256_bytes(&descriptor.digest)?;
+                match self.objects.read(&sha256).await {
+                    Ok(config_content) => update_created_from_config(created, &config_content),
+                    Err(AppError::NotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            } else if matches!(kind, "manifest" | "index") {
                 if already_seen {
                     continue;
                 }
@@ -455,6 +519,7 @@ impl OciRegistry {
                             &child_content,
                             objects,
                             missing_objects,
+                            created,
                         ))
                         .await?;
                     }
@@ -523,6 +588,23 @@ struct OciDescriptor {
     media_type: Option<String>,
     digest: String,
     size: u64,
+}
+
+#[derive(Deserialize)]
+struct OciImageConfigDocument {
+    created: Option<DateTime<Utc>>,
+}
+
+fn update_created_from_config(latest: &mut Option<DateTime<Utc>>, content: &[u8]) {
+    let Ok(config) = serde_json::from_slice::<OciImageConfigDocument>(content) else {
+        return;
+    };
+    let Some(created) = config.created else {
+        return;
+    };
+    if latest.as_ref().is_none_or(|current| current < &created) {
+        *latest = Some(created);
+    }
 }
 
 pub fn validate_repository_name(repository: &str) -> Result<(), AppError> {

@@ -6,7 +6,10 @@ use crate::error::AppError;
 #[cfg(feature = "surrealdb")]
 use crate::idmouse::IdmouseClient;
 use crate::package::{FileRecord, ProjectIndex, ProjectSummary};
+#[cfg(feature = "surrealdb")]
+use anyhow::Context;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
@@ -164,6 +167,8 @@ pub struct OciBundleRecord {
     pub digest: String,
     pub root_manifest_digest: String,
     pub root_media_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<DateTime<Utc>>,
     pub status: String,
     #[serde(default)]
     pub objects: Vec<OciObjectRecord>,
@@ -466,11 +471,21 @@ impl FilesystemMetadataStore {
 
 #[cfg(feature = "surrealdb")]
 pub async fn make_db(config: &MetadataStoreConfig) -> anyhow::Result<Arc<Surreal<Any>>> {
-    let db = Arc::new(any::connect(&config.uri).await?);
+    let db = Arc::new(
+        any::connect(&config.uri)
+            .await
+            .with_context(|| format!("failed to connect to the database at '{}'", config.uri))?,
+    );
     if let Some(idmouse) = config.idmouse.clone() {
         IdmouseClient::new(idmouse)
             .authenticate_db(db.clone())
-            .await?;
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to authenticate to the database at '{}' through idmouse",
+                    config.uri
+                )
+            })?;
     } else if let (Some(username), Some(password)) = (&config.username, config.password()?) {
         db.signin(surrealdb::opt::auth::Database {
             namespace: NAMESPACE.to_string(),
@@ -478,9 +493,20 @@ pub async fn make_db(config: &MetadataStoreConfig) -> anyhow::Result<Arc<Surreal
             username: username.to_string(),
             password,
         })
-        .await?;
+        .await
+        .with_context(|| {
+            format!(
+                "failed to connect to the database at '{}' as user '{}'",
+                config.uri, username
+            )
+        })?;
     }
-    setup_db(db.as_ref()).await?;
+    setup_db(db.as_ref()).await.with_context(|| {
+        format!(
+            "failed to set up the database at '{}' in namespace '{}' database '{}'",
+            config.uri, NAMESPACE, DATABASE
+        )
+    })?;
     Ok(db)
 }
 
@@ -814,7 +840,7 @@ impl MetadataStore for SurrealMetadataStore {
         let mut response = self
             .db
             .query(
-                "SELECT digest, root_manifest_digest, root_media_type, status, objects, missing_objects \
+                "SELECT digest, root_manifest_digest, root_media_type, created, status, objects, missing_objects \
                  FROM oci_bundle ORDER BY digest",
             )
             .await

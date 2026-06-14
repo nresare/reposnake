@@ -35,3 +35,7 @@ uri = "ws://surrealdb.surrealdb:8000"
 [metadata-store.idmouse]
 url = "http://idmouse.idmouse.svc/token/reposnake"
 token-path = "/var/run/secrets/tokens/idmouse"
+
+[admin]
+identity-provider = "kubernetes"
+required-claims = {sub="system:serviceaccount:default:default"}

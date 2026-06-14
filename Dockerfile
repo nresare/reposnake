@@ -21,7 +21,7 @@ COPY . .
 RUN cargo build --locked --release
 
 FROM gcr.io/distroless/cc-debian13:nonroot
-
+USER nonroot
 COPY --from=builder /build/target/release/reposnake /
 
 ENTRYPOINT ["/reposnake"]

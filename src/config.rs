@@ -26,6 +26,7 @@ pub struct Config {
     pub identity_providers: Vec<IdentityProviderConfig>,
     #[serde(rename = "publisher", default)]
     pub publishers: Vec<PublisherConfig>,
+    pub admin: Option<AdminConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -46,6 +47,16 @@ pub struct PublisherConfig {
     #[serde(default)]
     pub name: String,
     pub projects: Vec<String>,
+    #[serde(rename = "identity-provider")]
+    pub identity_provider: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "required-claims")]
+    pub required_claims: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct AdminConfig {
     #[serde(rename = "identity-provider")]
     pub identity_provider: Option<String>,
     #[serde(default)]
@@ -185,6 +196,21 @@ impl Config {
                         "publisher '{publisher_name}' project '{project}' is not a valid Python project or OCI repository name"
                     );
                 }
+            }
+        }
+
+        if let Some(admin) = &self.admin
+            && !disable_auth
+        {
+            let identity_provider = admin
+                .identity_provider
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("admin must define identity-provider"))?;
+            if identity_provider.is_empty() {
+                anyhow::bail!("admin identity-provider must not be empty");
+            }
+            if !identity_provider_names.contains(identity_provider) {
+                anyhow::bail!("admin references unknown identity-provider '{identity_provider}'");
             }
         }
 
@@ -443,6 +469,73 @@ sub = "buildkite:deploy"
             config.object_store.directory.as_deref(),
             Some(Path::new("/data"))
         );
+    }
+
+    #[test]
+    fn parses_admin_config() {
+        let config: Config = toml::from_str(
+            r#"
+origin = "http://localhost:8080"
+
+[[identity-provider]]
+name = "buildkite"
+audience = "reposnake"
+issuer = "https://issuer.example"
+validation-key = "shared-secret"
+
+[admin]
+identity-provider = "buildkite"
+
+[admin.required-claims]
+pipeline = "maintenance"
+
+[[publisher]]
+name = "ci"
+projects = ["reposnake-demo"]
+identity-provider = "buildkite"
+
+[publisher.required-claims]
+pipeline = "ci"
+"#,
+        )
+        .unwrap();
+
+        config.validate(false).unwrap();
+        let admin = config.admin.as_ref().unwrap();
+        assert_eq!(admin.identity_provider.as_deref(), Some("buildkite"));
+        assert_eq!(
+            admin.required_claims.get("pipeline").map(String::as_str),
+            Some("maintenance")
+        );
+    }
+
+    #[test]
+    fn rejects_admin_with_unknown_identity_provider() {
+        let config: Config = toml::from_str(
+            r#"
+origin = "http://localhost:8080"
+
+[[identity-provider]]
+name = "buildkite"
+audience = "reposnake"
+issuer = "https://issuer.example"
+validation-key = "shared-secret"
+
+[admin]
+identity-provider = "other"
+
+[[publisher]]
+name = "ci"
+projects = ["reposnake-demo"]
+identity-provider = "buildkite"
+
+[publisher.required-claims]
+pipeline = "ci"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate(false).is_err());
     }
 
     #[test]

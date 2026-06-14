@@ -8,9 +8,9 @@ use crate::metadata::{
 };
 use crate::object_store::SharedObjectStore;
 use axum::body::Bytes;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
@@ -36,6 +36,22 @@ pub struct OciManifest {
     pub content: Vec<u8>,
     pub digest: String,
     pub media_type: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OciMetadataMigrationReport {
+    pub converted: usize,
+    pub failed: usize,
+    pub remaining: usize,
+    pub incomplete: usize,
+    pub errors: Vec<OciMetadataMigrationError>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OciMetadataMigrationError {
+    pub repository: String,
+    pub digest: String,
+    pub error: String,
 }
 
 impl OciRegistry {
@@ -263,6 +279,67 @@ impl OciRegistry {
         self.metadata.list_oci_tags(repository).await
     }
 
+    pub async fn migrate_metadata(
+        &self,
+        limit: usize,
+    ) -> Result<OciMetadataMigrationReport, AppError> {
+        let existing_bundles = self
+            .metadata
+            .list_oci_bundles()
+            .await?
+            .into_iter()
+            .map(|bundle| bundle.digest)
+            .collect::<BTreeSet<_>>();
+        let mut pending = self
+            .metadata
+            .list_oci_manifests()
+            .await?
+            .into_iter()
+            .filter(|manifest| !existing_bundles.contains(&manifest.digest))
+            .fold(BTreeMap::new(), |mut manifests, manifest| {
+                manifests.entry(manifest.digest.clone()).or_insert(manifest);
+                manifests
+            })
+            .into_values()
+            .collect::<Vec<_>>();
+        pending.sort_by(|left, right| {
+            left.repository
+                .cmp(&right.repository)
+                .then_with(|| left.digest.cmp(&right.digest))
+        });
+        let initial_pending = pending.len();
+
+        let mut converted = 0;
+        let mut failed = 0;
+        let mut incomplete = 0;
+        let mut errors = Vec::new();
+        for manifest in pending.into_iter().take(limit) {
+            match self.migrate_manifest_metadata(&manifest).await {
+                Ok(bundle) => {
+                    converted += 1;
+                    if bundle.status == "incomplete" {
+                        incomplete += 1;
+                    }
+                }
+                Err(error) => {
+                    failed += 1;
+                    errors.push(OciMetadataMigrationError {
+                        repository: manifest.repository,
+                        digest: manifest.digest,
+                        error: error.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(OciMetadataMigrationReport {
+            converted,
+            failed,
+            remaining: initial_pending.saturating_sub(converted),
+            incomplete,
+            errors,
+        })
+    }
+
     async fn read_upload_state(
         &self,
         repository: &str,
@@ -287,6 +364,31 @@ impl OciRegistry {
             return Err(error);
         }
         writer.commit().await
+    }
+
+    async fn migrate_manifest_metadata(
+        &self,
+        manifest: &OciManifestRecord,
+    ) -> Result<OciBundleRecord, AppError> {
+        let sha256 = digest_sha256_bytes(&manifest.digest)?;
+        let content = self.objects.read(&sha256).await.map_err(|error| {
+            if matches!(error, AppError::NotFound(_)) {
+                AppError::NotFound(format!(
+                    "root OCI manifest '{}' is missing from object storage",
+                    manifest.digest
+                ))
+            } else {
+                error
+            }
+        })?;
+        let bundle = self
+            .materialize_bundle(&manifest.digest, &manifest.media_type, &content)
+            .await?;
+        for object in &bundle.objects {
+            self.metadata.store_oci_object(object.clone()).await?;
+        }
+        self.metadata.store_oci_bundle(bundle.clone()).await?;
+        Ok(bundle)
     }
 
     async fn materialize_bundle(

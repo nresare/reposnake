@@ -1960,9 +1960,12 @@ mod tests {
         let app = build_router(state);
         let token = test_token("builder", "ci");
         let layer_digest = format!("sha256:{}", sha256(b"referenced layer"));
+        let config = br#"{"created":"2026-06-14T08:50:55Z"}"#;
+        let config_digest = store_raw_object(object_store.as_ref(), config).await;
 
         let first_manifest = format!(
-            r#"{{"schemaVersion":2,"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{layer_digest}","size":16}}]}}"#
+            r#"{{"schemaVersion":2,"config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{layer_digest}","size":16}}]}}"#,
+            config.len()
         );
         let first_digest = store_raw_object(object_store.as_ref(), first_manifest.as_bytes()).await;
         metadata
@@ -2037,6 +2040,10 @@ mod tests {
                 .any(|object| object.digest == layer_digest
                     && object.size == 16
                     && object.kind == "layer")
+        );
+        assert_eq!(
+            metadata.oci_bundle(&first_digest).await.unwrap().created,
+            Some("2026-06-14T08:50:55Z".parse().unwrap())
         );
         assert!(metadata.oci_bundle(&second_digest).await.is_ok());
     }

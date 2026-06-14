@@ -3,7 +3,9 @@
 
 use crate::config::{MetadataStoreConfig, ObjectStoreBackend, ObjectStoreConfig};
 use crate::error::AppError;
-use crate::metadata::{FilesystemMetadataStore, SharedMetadataStore, build_metadata_store};
+use crate::metadata::{
+    FilesystemMetadataStore, OciBundleRecord, SharedMetadataStore, build_metadata_store,
+};
 use crate::object_store::{
     SharedObjectStore, build_object_store, migrate_filesystem_objects_to_store,
 };
@@ -11,6 +13,7 @@ use crate::package::{
     FileRecord, ProjectIndex, ProjectSummary, UploadPackage, is_safe_filename,
     is_valid_project_name, normalize_name,
 };
+use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,7 +38,7 @@ pub struct UtilizationReport {
     pub attributed_bytes: u64,
     pub categories: Vec<UtilizationCategory>,
     pub projects: Vec<ProjectUtilization>,
-    pub shared_objects: Vec<SharedObjectUtilization>,
+    pub shared_layer_groups: Vec<SharedLayerGroupUtilization>,
     pub largest_objects: Vec<ObjectUtilization>,
 }
 
@@ -63,11 +66,14 @@ pub struct ObjectUtilization {
 }
 
 #[derive(Debug, Clone)]
-pub struct SharedObjectUtilization {
-    pub sha256: String,
+pub struct SharedLayerGroupUtilization {
+    pub id: String,
+    pub layer_count: usize,
     pub size: u64,
-    pub reference_count: usize,
-    pub amortized_size: u64,
+    pub manifest_count: usize,
+    pub oldest_created: Option<DateTime<Utc>>,
+    pub newest_created: Option<DateTime<Utc>>,
+    pub layers: String,
     pub usage: String,
 }
 
@@ -197,14 +203,25 @@ impl PackageRepository {
                 },
             );
 
-        for bundle in self.metadata.list_oci_bundles().await? {
+        let bundles = self.metadata.list_oci_bundles().await?;
+        let mut shared_layer_groups =
+            shared_layer_groups(&bundles, &objects_by_digest, &tags_by_bundle)?;
+        shared_layer_groups.sort_by(|left, right| {
+            compare_optional_datetime(left.newest_created, right.newest_created)
+                .then_with(|| compare_optional_datetime(left.oldest_created, right.oldest_created))
+                .then_with(|| right.size.cmp(&left.size))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        shared_layer_groups.truncate(20);
+
+        for bundle in &bundles {
             let labels = tags_by_bundle
                 .get(&bundle.digest)
                 .cloned()
                 .unwrap_or_else(|| {
-                    BTreeSet::from([format!("bundle {}", short_digest(&bundle.digest))])
+                    BTreeSet::from([format!("manifest {}", short_digest(&bundle.digest))])
                 });
-            for object in bundle.objects {
+            for object in &bundle.objects {
                 let sha256 = digest_sha256(&object.digest)?;
                 let category = oci_category(&object.kind);
                 for label in &labels {
@@ -292,32 +309,6 @@ impl PackageRepository {
         });
         largest_objects.truncate(20);
 
-        let mut shared_objects = objects_by_digest
-            .iter()
-            .filter_map(|(sha256, size)| {
-                let labels = labels_by_digest.get(sha256)?;
-                let reference_count = labels.len();
-                if reference_count < 2 {
-                    return None;
-                }
-                Some(SharedObjectUtilization {
-                    sha256: sha256.clone(),
-                    size: *size,
-                    reference_count,
-                    amortized_size: size / reference_count as u64,
-                    usage: usage_summary(Some(labels)),
-                })
-            })
-            .collect::<Vec<_>>();
-        shared_objects.sort_by(|left, right| {
-            right
-                .reference_count
-                .cmp(&left.reference_count)
-                .then_with(|| right.size.cmp(&left.size))
-                .then_with(|| left.sha256.cmp(&right.sha256))
-        });
-        shared_objects.truncate(20);
-
         Ok(UtilizationReport {
             total_objects,
             total_bytes,
@@ -325,7 +316,7 @@ impl PackageRepository {
             attributed_bytes,
             categories,
             projects,
-            shared_objects,
+            shared_layer_groups,
             largest_objects,
         })
     }
@@ -529,6 +520,141 @@ fn usage_summary(labels: Option<&BTreeSet<String>>) -> String {
         summary.push_str(&format!(" and {remaining} more"));
     }
     summary
+}
+
+fn shared_layer_groups(
+    bundles: &[OciBundleRecord],
+    objects_by_digest: &BTreeMap<String, u64>,
+    tags_by_bundle: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<Vec<SharedLayerGroupUtilization>, AppError> {
+    let mut layers_by_manifest = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut created_by_manifest = BTreeMap::new();
+    let mut manifests_by_layer = BTreeMap::<String, BTreeSet<String>>::new();
+
+    for bundle in bundles {
+        let mut layers = BTreeSet::new();
+        for object in &bundle.objects {
+            if object.kind != "layer" {
+                continue;
+            }
+            layers.insert(digest_sha256(&object.digest)?);
+        }
+        if layers.is_empty() {
+            continue;
+        }
+        for layer in &layers {
+            manifests_by_layer
+                .entry(layer.clone())
+                .or_default()
+                .insert(bundle.digest.clone());
+        }
+        created_by_manifest.insert(bundle.digest.clone(), bundle.created);
+        layers_by_manifest.insert(bundle.digest.clone(), layers);
+    }
+
+    let mut candidates = BTreeMap::<BTreeSet<String>, BTreeSet<String>>::new();
+    for manifests in manifests_by_layer.values() {
+        if manifests.len() < 2 {
+            continue;
+        }
+        let Some(closed_layers) = intersect_manifest_layers(manifests, &layers_by_manifest) else {
+            continue;
+        };
+        let support = layers_by_manifest
+            .iter()
+            .filter_map(|(manifest, layers)| {
+                if closed_layers.is_subset(layers) {
+                    Some(manifest.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<BTreeSet<_>>();
+        if support.len() >= 2 {
+            candidates.insert(closed_layers, support);
+        }
+    }
+
+    candidates
+        .into_iter()
+        .map(|(layers, manifests)| {
+            let labels = manifests
+                .iter()
+                .flat_map(|manifest| {
+                    tags_by_bundle.get(manifest).cloned().unwrap_or_else(|| {
+                        BTreeSet::from([format!("manifest {}", short_digest(manifest))])
+                    })
+                })
+                .collect::<BTreeSet<_>>();
+            let created = manifests
+                .iter()
+                .filter_map(|manifest| created_by_manifest.get(manifest).and_then(|value| *value))
+                .collect::<Vec<_>>();
+            let size = layers
+                .iter()
+                .filter_map(|layer| objects_by_digest.get(layer))
+                .sum();
+            Ok(SharedLayerGroupUtilization {
+                id: shared_group_id(&layers),
+                layer_count: layers.len(),
+                size,
+                manifest_count: manifests.len(),
+                oldest_created: created.iter().min().copied(),
+                newest_created: created.iter().max().copied(),
+                layers: digest_summary(&layers),
+                usage: usage_summary(Some(&labels)),
+            })
+        })
+        .collect()
+}
+
+fn intersect_manifest_layers(
+    manifests: &BTreeSet<String>,
+    layers_by_manifest: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<BTreeSet<String>> {
+    let mut manifests = manifests.iter();
+    let first = layers_by_manifest.get(manifests.next()?)?.clone();
+    Some(manifests.fold(first, |intersection, manifest| {
+        let Some(layers) = layers_by_manifest.get(manifest) else {
+            return BTreeSet::new();
+        };
+        intersection.intersection(layers).cloned().collect()
+    }))
+}
+
+fn shared_group_id(layers: &BTreeSet<String>) -> String {
+    let mut hasher = Sha256::new();
+    for layer in layers {
+        hasher.update(layer.as_bytes());
+        hasher.update([0]);
+    }
+    hex::encode(hasher.finalize()).chars().take(12).collect()
+}
+
+fn digest_summary(digests: &BTreeSet<String>) -> String {
+    let mut summary = digests
+        .iter()
+        .take(3)
+        .map(|digest| digest.chars().take(12).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = digests.len().saturating_sub(3);
+    if remaining > 0 {
+        summary.push_str(&format!(" and {remaining} more"));
+    }
+    summary
+}
+
+fn compare_optional_datetime(
+    left: Option<DateTime<Utc>>,
+    right: Option<DateTime<Utc>>,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
 }
 
 fn digest_sha256(digest: &str) -> Result<String, AppError> {

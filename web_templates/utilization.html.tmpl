@@ -52,26 +52,28 @@
 </section>
 
 <section class="utilization-section" aria-labelledby="shared-title">
-<h2 id="shared-title">Shared objects</h2>
-{{#if shared_objects}}
-<table class="utilization-table objects-table">
+<h2 id="shared-title">Shared layer groups</h2>
+{{#if shared_layer_groups}}
+<table class="utilization-table shared-layer-table">
 <thead>
-<tr><th>Digest</th><th>Size</th><th>Refs</th><th>Amortized</th><th>Referenced by</th></tr>
+<tr><th>Group</th><th>Size</th><th>Layers</th><th>Used by</th><th>Oldest image</th><th>Newest image</th><th>Examples</th></tr>
 </thead>
 <tbody>
-{{#each shared_objects}}
+{{#each shared_layer_groups}}
 <tr>
-<td><code title="{{sha256}}">{{short_sha256}}</code></td>
+<td><code title="{{layers}}">{{id}}</code></td>
 <td>{{size}}</td>
-<td>{{reference_count}}</td>
-<td>{{amortized_size}}</td>
+<td>{{layer_count}}</td>
+<td title="{{manifest_count}} manifests">{{manifest_label}}</td>
+<td>{{oldest_created}}</td>
+<td>{{newest_created}}</td>
 <td>{{usage}}</td>
 </tr>
 {{/each}}
 </tbody>
 </table>
 {{else}}
-<p class="empty">No objects are referenced by more than one known package or OCI image.</p>
+<p class="empty">No OCI layer groups are referenced by more than one manifest.</p>
 {{/if}}
 </section>
 

@@ -47,7 +47,8 @@ pub struct AppState {
 pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Result<AppState> {
     auth::install_jwt_crypto_provider();
     let repository =
-        PackageRepository::from_config(&config.metadata_store, &config.object_store).await?;
+        PackageRepository::from_config(&config.metadata_store, &config.object_store, &config.cache)
+            .await?;
     Ok(AppState {
         oci_registry: OciRegistry::new(repository.metadata_store(), repository.object_store()),
         repository,

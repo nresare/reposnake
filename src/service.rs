@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: The reposnake contributors
 
 use crate::auth;
-use crate::config::{AdminConfig, Config, IdentityProviderConfig, PublisherConfig};
+use crate::config::{AdminConfig, Config, PublisherConfig};
 use crate::embed::StaticFile;
 use crate::error::AppError;
 use crate::oci::{DOCKER_DISTRIBUTION_API_VERSION, OciRegistry};
@@ -20,7 +20,6 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use jsonwebtoken::{Validation, decode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,19 +44,63 @@ pub struct AppState {
     pub origin: String,
 }
 
+const ADMIN_ROLE_PREFIX: &str = "__reposnake_admin:";
+
 pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Result<AppState> {
+    auth::install_jwt_crypto_provider();
     let repository =
         PackageRepository::from_config(&config.metadata_store, &config.object_store).await?;
     Ok(AppState {
         oci_registry: OciRegistry::new(repository.metadata_store(), repository.object_store()),
         repository,
-        subject_validator: SubjectValidator::new(config.identity_providers.clone(), disable_auth),
+        subject_validator: SubjectValidator::new(auth_roles(config, disable_auth)?, disable_auth)?,
         publishers: Arc::new(config.publishers.clone()),
         admin: config.admin.clone(),
         max_upload_bytes: config.max_upload_bytes,
         templates: Templates::new()?,
         origin: config.origin.clone(),
     })
+}
+
+fn auth_roles(config: &Config, disable_auth: bool) -> anyhow::Result<Vec<authzoo::RoleConfig>> {
+    let mut roles = config.roles.clone();
+    if disable_auth {
+        return Ok(roles);
+    }
+    let Some(admin) = &config.admin else {
+        return Ok(roles);
+    };
+    let Some(base_role_name) = admin.identity_provider.as_deref() else {
+        return Ok(roles);
+    };
+    let Some(base_role) = roles.iter().find(|role| role.name == base_role_name) else {
+        return Ok(roles);
+    };
+
+    let mut admin_role = base_role.clone();
+    admin_role.name = admin_role_name(base_role_name);
+    if roles.iter().any(|role| role.name == admin_role.name) {
+        anyhow::bail!(
+            "internal admin role '{}' conflicts with configured role",
+            admin_role.name
+        );
+    }
+    for (claim, requirement) in &admin.required_claims {
+        if let Some(role_requirement) = admin_role.claims.get(claim)
+            && role_requirement != requirement
+        {
+            anyhow::bail!(
+                "admin required-claims duplicates role claim '{claim}' with a different requirement"
+            );
+        }
+        admin_role.claims.insert(claim.clone(), requirement.clone());
+    }
+    roles.push(admin_role);
+    Ok(roles)
+}
+
+fn admin_role_name(base_role_name: &str) -> String {
+    format!("{ADMIN_ROLE_PREFIX}{base_role_name}")
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -178,8 +221,8 @@ async fn oci_dispatch(
     if let Some((repository, upload_uuid)) = split_oci_upload_path(&path) {
         return match method {
             Method::PATCH => {
-                let claims = authenticate_oci_push(&state, &headers, repository)?;
-                state.authorize_oci_repository(repository, &claims)?;
+                let bearer_token = authenticate_oci_push(&state, &headers, repository)?;
+                state.authorize_oci_repository(repository, bearer_token.as_deref())?;
                 let upload = state
                     .oci_registry
                     .append_upload(repository, upload_uuid, body)
@@ -190,8 +233,8 @@ async fn oci_dispatch(
                 let digest = query.get("digest").ok_or_else(|| {
                     AppError::BadRequest("missing digest query parameter".to_string())
                 })?;
-                let claims = authenticate_oci_push(&state, &headers, repository)?;
-                state.authorize_oci_repository(repository, &claims)?;
+                let bearer_token = authenticate_oci_push(&state, &headers, repository)?;
+                state.authorize_oci_repository(repository, bearer_token.as_deref())?;
                 let blob = state
                     .oci_registry
                     .finish_upload(repository, upload_uuid, digest, body)
@@ -208,8 +251,8 @@ async fn oci_dispatch(
     if let Some(repository) = split_oci_upload_start_path(&path) {
         return match method {
             Method::POST => {
-                let claims = authenticate_oci_push(&state, &headers, repository)?;
-                state.authorize_oci_repository(repository, &claims)?;
+                let bearer_token = authenticate_oci_push(&state, &headers, repository)?;
+                state.authorize_oci_repository(repository, bearer_token.as_deref())?;
                 if let Some(digest) = query.get("digest") {
                     let blob = state
                         .oci_registry
@@ -248,8 +291,8 @@ async fn oci_dispatch(
             Method::GET => oci_get_manifest(&state, repository, reference, false).await,
             Method::HEAD => oci_get_manifest(&state, repository, reference, true).await,
             Method::PUT => {
-                let claims = authenticate_oci_push(&state, &headers, repository)?;
-                state.authorize_oci_repository(repository, &claims)?;
+                let bearer_token = authenticate_oci_push(&state, &headers, repository)?;
+                state.authorize_oci_repository(repository, bearer_token.as_deref())?;
                 let content_type = headers
                     .get(header::CONTENT_TYPE)
                     .and_then(|value| value.to_str().ok())
@@ -278,9 +321,8 @@ async fn oci_token(
     headers: HeaderMap,
 ) -> Result<Json<OciTokenResponse>, AppError> {
     let token = auth::extract_upload_token(&headers)?;
-    let claims = state.subject_validator.validate(Some(&token))?;
     if let Some(scope) = request.scope.as_deref() {
-        authorize_oci_token_scope(&state, &claims, scope)?;
+        authorize_oci_token_scope(&state, Some(&token), scope)?;
     }
     Ok(Json(OciTokenResponse {
         token: token.clone(),
@@ -510,7 +552,7 @@ fn authenticate_oci_push(
     state: &AppState,
     headers: &HeaderMap,
     repository: &str,
-) -> Result<SourceClaims, AppError> {
+) -> Result<Option<String>, AppError> {
     authenticate_push(state, headers).map_err(|error| match error {
         AppError::Unauthorized(message) => AppError::OciUnauthorized {
             message,
@@ -520,13 +562,13 @@ fn authenticate_oci_push(
     })
 }
 
-fn authenticate_push(state: &AppState, headers: &HeaderMap) -> Result<SourceClaims, AppError> {
+fn authenticate_push(state: &AppState, headers: &HeaderMap) -> Result<Option<String>, AppError> {
     let bearer_token = match auth::extract_upload_token(headers) {
         Ok(token) => Some(token),
         Err(_error) if !state.subject_validator.auth_enabled() => None,
         Err(error) => return Err(error),
     };
-    state.subject_validator.validate(bearer_token.as_deref())
+    Ok(bearer_token)
 }
 
 fn oci_authenticate_challenge(state: &AppState, repository: &str) -> String {
@@ -555,7 +597,7 @@ fn quoted_header_value(value: &str) -> String {
 
 fn authorize_oci_token_scope(
     state: &AppState,
-    claims: &SourceClaims,
+    bearer_token: Option<&str>,
     scope: &str,
 ) -> Result<(), AppError> {
     let Some(repository_scope) = scope.strip_prefix("repository:") else {
@@ -572,7 +614,7 @@ fn authorize_oci_token_scope(
         )));
     }
     if actions.split(',').any(|action| action == "push") {
-        state.authorize_oci_repository(repository, claims)?;
+        state.authorize_oci_repository(repository, bearer_token)?;
     }
     Ok(())
 }
@@ -631,16 +673,15 @@ async fn upload_distribution(
         }
         Err(error) => return Err(error),
     };
-    let source_claims = state.subject_validator.validate(bearer_token.as_deref())?;
     let upload = parse_upload_form(multipart).await?;
     let normalized_project = normalize_name(&upload.name);
-    state.authorize_upload(&normalized_project, &source_claims)?;
+    let matching_roles = state.authorize_upload(&normalized_project, bearer_token.as_deref())?;
     let record = state.repository.store_upload(upload).await?;
 
     info!(
         project = %normalized_project,
         filename = %record.filename,
-        subject = %source_claims.subject(),
+        roles = ?matching_roles,
         "package uploaded"
     );
     Ok((StatusCode::OK, "OK\n").into_response())
@@ -658,76 +699,69 @@ impl AppState {
                 "admin endpoints are not configured".to_string(),
             ));
         };
+        let role = admin.identity_provider.as_deref().ok_or_else(|| {
+            AppError::Internal("admin config is missing a role reference".to_string())
+        })?;
         let bearer_token = auth::extract_upload_token(headers)?;
-        let claims = self.subject_validator.validate(Some(&bearer_token))?;
-        if !claims.matches_identity_provider(admin.identity_provider.as_deref()) {
-            return Err(AppError::Forbidden(
-                "token was not issued by the configured admin identity provider".to_string(),
-            ));
-        }
-        if let Some((claim_name, required_value)) =
-            claims.first_missing_required_claim(&admin.required_claims)
-        {
-            debug!(
-                claim_name,
-                required_value,
-                subject = %claims.subject(),
-                "admin policy did not match token claims"
-            );
+        let matching_roles = self.subject_validator.validate(Some(&bearer_token))?;
+        let admin_role = admin_role_name(role);
+        if !matching_roles.contains(&admin_role) {
             return Err(AppError::Forbidden(
                 "token claims do not satisfy the admin policy".to_string(),
             ));
         }
-        debug!(subject = %claims.subject(), "admin authorization check passed");
+        debug!(role = %admin_role, "admin authorization check passed");
         Ok(())
     }
 
     fn authorize_upload(
         &self,
         normalized_project: &str,
-        claims: &SourceClaims,
-    ) -> Result<(), AppError> {
+        bearer_token: Option<&str>,
+    ) -> Result<BTreeSet<String>, AppError> {
         if !self.subject_validator.auth_enabled() {
             debug!(
                 project = %normalized_project,
                 "publisher authorization skipped because auth is disabled"
             );
-            return Ok(());
+            return Ok(BTreeSet::new());
         }
 
+        let matching_roles = self.subject_validator.validate(bearer_token)?;
         let mut project_policy_seen = false;
         for publisher in self.publishers.iter() {
             if !publisher_allows_project(publisher, normalized_project) {
                 continue;
             }
-            if !claims.matches_identity_provider(publisher.identity_provider.as_deref()) {
-                continue;
-            }
             project_policy_seen = true;
-            if let Some((claim_name, required_value)) =
-                claims.first_missing_required_claim(&publisher.required_claims)
-            {
+            let role = publisher.role.as_deref().ok_or_else(|| {
+                AppError::Internal(format!(
+                    "publisher '{}' is missing a role reference",
+                    publisher.display_name()
+                ))
+            })?;
+            if !matching_roles.contains(role) {
                 debug!(
                     publisher = %publisher.display_name(),
                     project = %normalized_project,
-                    claim_name,
-                    required_value,
-                    "publisher policy did not match token claims"
+                    role,
+                    roles = ?matching_roles,
+                    "publisher role did not match token"
                 );
                 continue;
             }
             debug!(
                 publisher = %publisher.display_name(),
                 project = %normalized_project,
-                subject = %claims.subject(),
+                role,
                 "publisher authorization check passed"
             );
-            return Ok(());
+            return Ok(matching_roles);
         }
 
         if project_policy_seen {
             Err(AppError::Forbidden(format!(
-                "token claims do not satisfy a publisher policy for project '{normalized_project}'"
+                "token does not satisfy a publisher role for project '{normalized_project}'"
             )))
         } else {
             Err(AppError::Forbidden(format!(
@@ -739,49 +773,51 @@ impl AppState {
     fn authorize_oci_repository(
         &self,
         repository: &str,
-        claims: &SourceClaims,
-    ) -> Result<(), AppError> {
+        bearer_token: Option<&str>,
+    ) -> Result<BTreeSet<String>, AppError> {
         if !self.subject_validator.auth_enabled() {
             debug!(
                 repository,
                 "OCI publisher authorization skipped because auth is disabled"
             );
-            return Ok(());
+            return Ok(BTreeSet::new());
         }
 
+        let matching_roles = self.subject_validator.validate(bearer_token)?;
         let mut repository_policy_seen = false;
         for publisher in self.publishers.iter() {
             if !publisher_allows_oci_repository(publisher, repository) {
                 continue;
             }
-            if !claims.matches_identity_provider(publisher.identity_provider.as_deref()) {
-                continue;
-            }
             repository_policy_seen = true;
-            if let Some((claim_name, required_value)) =
-                claims.first_missing_required_claim(&publisher.required_claims)
-            {
+            let role = publisher.role.as_deref().ok_or_else(|| {
+                AppError::Internal(format!(
+                    "publisher '{}' is missing a role reference",
+                    publisher.display_name()
+                ))
+            })?;
+            if !matching_roles.contains(role) {
                 debug!(
                     publisher = %publisher.display_name(),
                     repository,
-                    claim_name,
-                    required_value,
-                    "OCI publisher policy did not match token claims"
+                    role,
+                    roles = ?matching_roles,
+                    "OCI publisher role did not match token"
                 );
                 continue;
             }
             debug!(
                 publisher = %publisher.display_name(),
                 repository,
-                subject = %claims.subject(),
+                role,
                 "OCI publisher authorization check passed"
             );
-            return Ok(());
+            return Ok(matching_roles);
         }
 
         if repository_policy_seen {
             Err(AppError::Forbidden(format!(
-                "token claims do not satisfy a publisher policy for OCI repository '{repository}'"
+                "token does not satisfy a publisher role for OCI repository '{repository}'"
             )))
         } else {
             Err(AppError::Forbidden(format!(
@@ -813,124 +849,39 @@ pub struct SubjectValidator {
 #[derive(Clone)]
 enum SubjectValidationMode {
     Disabled,
-    Enabled(BTreeMap<String, IdentityProviderConfig>),
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SourceClaims {
-    #[serde(skip)]
-    identity_provider: Option<String>,
-    sub: String,
-    #[serde(flatten)]
-    claims: BTreeMap<String, Value>,
-}
-
-impl SourceClaims {
-    fn unauthenticated() -> Self {
-        Self {
-            identity_provider: None,
-            sub: "unauthenticated".to_string(),
-            claims: BTreeMap::new(),
-        }
-    }
-
-    pub fn subject(&self) -> &str {
-        &self.sub
-    }
-
-    fn first_missing_required_claim<'a>(
-        &self,
-        required_claims: &'a BTreeMap<String, String>,
-    ) -> Option<(&'a str, &'a str)> {
-        required_claims
-            .iter()
-            .find(|(claim_name, required_value)| {
-                self.claim_value(claim_name.as_str()) != Some(required_value.as_str())
-            })
-            .map(|(claim_name, required_value)| (claim_name.as_str(), required_value.as_str()))
-    }
-
-    fn claim_value(&self, claim_name: &str) -> Option<&str> {
-        if claim_name == "sub" {
-            return Some(&self.sub);
-        }
-        self.claims.get(claim_name).and_then(Value::as_str)
-    }
-
-    fn matches_identity_provider(&self, identity_provider: Option<&str>) -> bool {
-        self.identity_provider.as_deref() == identity_provider
-    }
+    Enabled(authzoo::TokenValidator),
 }
 
 impl SubjectValidator {
-    pub fn new(identity_providers: Vec<IdentityProviderConfig>, disable_auth: bool) -> Self {
+    pub fn new(roles: Vec<authzoo::RoleConfig>, disable_auth: bool) -> anyhow::Result<Self> {
         let mode = if disable_auth {
             SubjectValidationMode::Disabled
         } else {
-            let identity_providers = identity_providers
-                .into_iter()
-                .map(|identity_provider| (identity_provider.name.clone(), identity_provider))
-                .collect();
-            SubjectValidationMode::Enabled(identity_providers)
+            SubjectValidationMode::Enabled(authzoo::TokenValidator::new(roles)?)
         };
-        Self { mode }
+        Ok(Self { mode })
     }
 
-    pub fn validate(&self, bearer_token: Option<&str>) -> Result<SourceClaims, AppError> {
-        let identity_providers = match &self.mode {
+    pub fn validate(&self, bearer_token: Option<&str>) -> Result<BTreeSet<String>, AppError> {
+        let validator = match &self.mode {
             SubjectValidationMode::Disabled => {
                 debug!("upload token claim validation skipped because auth is disabled");
-                return Ok(SourceClaims::unauthenticated());
+                return Ok(BTreeSet::new());
             }
-            SubjectValidationMode::Enabled(identity_providers) => identity_providers,
+            SubjectValidationMode::Enabled(validator) => validator,
         };
         let bearer_token = bearer_token
             .ok_or_else(|| AppError::Unauthorized("missing Authorization header".to_string()))?;
-        let mut last_error = None;
-        for authentication in identity_providers.values() {
-            match self.validate_with_provider(authentication, bearer_token) {
-                Ok(mut claims) => {
-                    claims.identity_provider = Some(authentication.name.clone());
-                    return Ok(claims);
-                }
-                Err(error) => {
-                    last_error = Some(error);
-                }
-            }
-        }
-        Err(last_error.unwrap_or_else(|| {
-            AppError::Unauthorized("no identity providers configured".to_string())
-        }))
-    }
-
-    fn validate_with_provider(
-        &self,
-        authentication: &IdentityProviderConfig,
-        bearer_token: &str,
-    ) -> Result<SourceClaims, AppError> {
-        let (algorithm, decoding_key) =
-            auth::decoding_key_for_token(authentication, bearer_token).map_err(AppError::from)?;
+        debug!("validating upload token claims");
+        let roles = validator
+            .validate(bearer_token)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         debug!(
-            algorithm = ?algorithm,
-            identity_provider = %authentication.name,
-            audience = %authentication.audience,
-            issuer = %authentication.issuer,
-            "validating upload token claims"
-        );
-        let mut validation = Validation::new(algorithm);
-        validation.set_audience(&[&authentication.audience]);
-        validation.set_issuer(&[&authentication.issuer]);
-
-        let decoded =
-            decode::<SourceClaims>(bearer_token, &decoding_key, &validation).map_err(|error| {
-                AppError::Unauthorized(format!("failed to validate upload token: {error}"))
-            })?;
-        debug!(
-            identity_provider = %authentication.name,
-            subject = %decoded.claims.sub,
+            roles = ?roles,
             "upload token claims validated"
         );
-        Ok(decoded.claims)
+        Ok(roles)
     }
 
     pub fn auth_enabled(&self) -> bool {
@@ -1556,8 +1507,8 @@ impl ProjectFileJson {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, SubjectValidator, build_router};
-    use crate::config::{AdminConfig, IdentityProviderConfig, PublisherConfig};
+    use super::{AppState, SubjectValidator, admin_role_name, build_router};
+    use crate::config::{AdminConfig, PublisherConfig};
     use crate::metadata::OciManifestRecord;
     use crate::oci::OciRegistry;
     use crate::package::SIMPLE_API_VERSION;
@@ -2596,7 +2547,7 @@ mod tests {
         AppState {
             oci_registry: OciRegistry::new(repository.metadata_store(), repository.object_store()),
             repository,
-            subject_validator: SubjectValidator::new(Vec::new(), true),
+            subject_validator: SubjectValidator::new(Vec::new(), true).unwrap(),
             publishers: Arc::new(Vec::new()),
             admin: None,
             max_upload_bytes: 1024 * 1024,
@@ -2610,15 +2561,8 @@ mod tests {
         AppState {
             oci_registry: OciRegistry::new(repository.metadata_store(), repository.object_store()),
             repository,
-            subject_validator: SubjectValidator::new(
-                vec![IdentityProviderConfig {
-                    name: "buildkite".to_string(),
-                    audience: "reposnake".to_string(),
-                    issuer: "https://issuer.example".to_string(),
-                    validation_key: Some("shared-secret".to_string()),
-                }],
-                false,
-            ),
+            subject_validator: SubjectValidator::new(vec![buildkite_role("buildkite")], false)
+                .unwrap(),
             publishers: Arc::new(vec![PublisherConfig {
                 name: "ci".to_string(),
                 projects: vec![
@@ -2626,8 +2570,7 @@ mod tests {
                     "team/image".to_string(),
                     "team/worker".to_string(),
                 ],
-                identity_provider: Some("buildkite".to_string()),
-                required_claims: BTreeMap::from([("pipeline".to_string(), "ci".to_string())]),
+                role: Some("buildkite".to_string()),
             }]),
             admin: None,
             max_upload_bytes: 1024 * 1024,
@@ -2640,9 +2583,34 @@ mod tests {
         let mut state = authenticated_state(path).await;
         state.admin = Some(AdminConfig {
             identity_provider: Some("buildkite".to_string()),
-            required_claims: BTreeMap::from([("pipeline".to_string(), "ci".to_string())]),
+            required_claims: BTreeMap::from([(
+                "pipeline".to_string(),
+                authzoo::ClaimRequirement::equals("ci"),
+            )]),
         });
+        state.subject_validator = SubjectValidator::new(
+            vec![
+                buildkite_role("buildkite"),
+                buildkite_role(&admin_role_name("buildkite")),
+            ],
+            false,
+        )
+        .unwrap();
         state
+    }
+
+    fn buildkite_role(name: &str) -> authzoo::RoleConfig {
+        authzoo::RoleConfig {
+            name: name.to_string(),
+            audience: "reposnake".to_string(),
+            issuer: "https://issuer.example".to_string(),
+            validation_key: Some("shared-secret".to_string()),
+            algorithms: vec![authzoo::JwtAlgorithm::Hs256],
+            claims: BTreeMap::from([(
+                "pipeline".to_string(),
+                authzoo::ClaimRequirement::equals("ci"),
+            )]),
+        }
     }
 
     fn multipart_upload_body(name: &str, version: &str, content: &[u8]) -> Vec<u8> {

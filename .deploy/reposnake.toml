@@ -2,28 +2,31 @@ bind-address = "0.0.0.0:8080"
 max-upload-bytes = 104857600
 origin = "https://repo.noa.re"
 
-[[identity-provider]]
+[[role]]
 name = "kubernetes"
 audience = "repo.noa.re"
 issuer = "https://k8s.noa.re"
 
+[role.claims]
+sub = "system:serviceaccount:default:default"
 
-[[identity-provider]]
+[[role]]
 name = "buildkite"
 audience = "repo.noa.re"
 issuer = "https://agent.buildkite.com"
 
+[role.claims]
+organization_slug = "nresare"
+
 [[publisher]]
 name = "ci"
 projects = ["*"]
-required-claims = {organization_slug="nresare"}
-identity-provider = "buildkite"
+role = "buildkite"
 
 [[publisher]]
 name = "manual"
 projects = ["*"]
-required-claims = {sub="system:serviceaccount:default:default"}
-identity-provider = "kubernetes"
+role = "kubernetes"
 
 [object-store]
 backend = "s3"

@@ -7,7 +7,6 @@ pub mod embed;
 pub mod error;
 #[cfg(feature = "surrealdb")]
 pub mod idmouse;
-pub mod kubernetes;
 pub mod metadata;
 pub mod object_store;
 pub mod oci;

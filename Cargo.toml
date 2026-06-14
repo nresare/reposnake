@@ -12,6 +12,7 @@ surrealdb = ["dep:surrealdb"]
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+authzoo = "0.1.1"
 aws-config = { version = "1.8", optional = true }
 aws-sdk-s3 = { version = "1.132", optional = true }
 axum = { version = "0.8", features = ["multipart"] }

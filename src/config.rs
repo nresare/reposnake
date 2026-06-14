@@ -382,7 +382,7 @@ fn default_object_cache_enabled() -> bool {
 }
 
 fn default_object_cache_directory() -> PathBuf {
-    "/var/lib/reposnake-cache".into()
+    "/var/tmp/reposnake-cache".into()
 }
 
 fn default_object_cache_max_file_size() -> u64 {
@@ -518,7 +518,7 @@ role = "buildkite"
         assert!(config.cache.enabled);
         assert_eq!(
             config.cache.directory.as_path(),
-            Path::new("/var/lib/reposnake-cache")
+            Path::new("/var/tmp/reposnake-cache")
         );
         assert_eq!(config.cache.max_file_size, 200 * 1024);
         assert_eq!(config.cache.max_total_size, 1024 * 1024 * 1024);

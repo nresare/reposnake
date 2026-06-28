@@ -9,5 +9,6 @@ emptydir-path = "/var/tmp"
 [website.env]
 AWS_STS_REGIONAL_ENDPOINTS = "regional"
 AWS_REGION = "eu-west-2"
-AWS_ROLE_ARN = "arn:aws:iam::190019502607:role/repo-noa-re"
+AWS_ENDPOINT_URL = "http://rook-ceph-rgw-berries.rook-ceph.svc"
+AWS_ROLE_ARN = "arn:aws:iam:::role/reposnake"
 AWS_WEB_IDENTITY_TOKEN_FILE = "/var/run/secrets/tokens/sts.amazonaws.com"

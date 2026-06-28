@@ -12,6 +12,7 @@ use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config as AwsS3Config};
 use sha2::{Digest, Sha256};
+use std::error::Error;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncWriteExt;
@@ -25,18 +26,22 @@ pub struct S3ObjectStore {
     bucket: String,
     prefix: String,
     temp_directory: PathBuf,
+    configuration_summary: String,
 }
 
 impl S3ObjectStore {
     pub async fn from_bucket(bucket: &str) -> anyhow::Result<Self> {
         let shared_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
-        let builder = AwsS3Config::from(&shared_config).to_builder();
+        let builder = AwsS3Config::from(&shared_config)
+            .to_builder()
+            .force_path_style(true);
 
         Ok(Self {
             client: Client::from_conf(builder.build()),
             bucket: bucket.to_string(),
             prefix: OBJECT_KEY_PREFIX.to_string(),
             temp_directory: default_temp_directory(),
+            configuration_summary: configuration_summary(),
         })
     }
 
@@ -65,7 +70,11 @@ impl ObjectStore for S3ObjectStore {
                 if is_s3_get_not_found(&error) {
                     AppError::NotFound(format!("object '{}' not found", hex::encode(sha256)))
                 } else {
-                    AppError::Internal(format!("failed to read S3 object '{key}': {error}"))
+                    AppError::Internal(format!(
+                        "failed to read S3 object '{key}' from bucket '{}': {}",
+                        self.bucket,
+                        format_error_chain(&error)
+                    ))
                 }
             })?;
         let bytes = output.body.collect().await.map_err(|error| {
@@ -87,8 +96,11 @@ impl ObjectStore for S3ObjectStore {
             .await
             .map_err(|error| {
                 AppError::Internal(format!(
-                    "failed to list S3 objects with prefix '{}' in bucket '{}': {error}",
-                    self.prefix, self.bucket
+                    "S3 availability check failed while listing prefix '{}' in bucket '{}': {}; {}",
+                    self.prefix,
+                    self.bucket,
+                    format_error_chain(&error),
+                    self.configuration_summary
                 ))
             })?;
         Ok(())
@@ -137,8 +149,9 @@ impl ObjectStore for S3ObjectStore {
             .await
             .map_err(|error| {
                 AppError::Internal(format!(
-                    "failed to delete S3 object '{key}' from bucket '{}': {error}",
-                    self.bucket
+                    "failed to delete S3 object '{key}' from bucket '{}': {}",
+                    self.bucket,
+                    format_error_chain(&error)
                 ))
             })?;
         Ok(())
@@ -158,8 +171,10 @@ impl ObjectStore for S3ObjectStore {
             }
             let output = request.send().await.map_err(|error| {
                 AppError::Internal(format!(
-                    "failed to list S3 objects in bucket '{}' with prefix '{}': {error}",
-                    self.bucket, self.prefix
+                    "failed to list S3 objects in bucket '{}' with prefix '{}': {}",
+                    self.bucket,
+                    self.prefix,
+                    format_error_chain(&error)
                 ))
             })?;
             for object in output.contents() {
@@ -246,8 +261,9 @@ impl ObjectWriter for S3ObjectWriter {
             Err(error) if is_s3_head_not_found(&error) => false,
             Err(error) => {
                 let message = format!(
-                    "failed to check S3 object '{key}' in bucket '{}': {error}",
-                    self.bucket
+                    "failed to check S3 object '{key}' in bucket '{}': {}",
+                    self.bucket,
+                    format_error_chain(&error)
                 );
                 self.abort().await?;
                 return Err(AppError::Internal(message));
@@ -288,8 +304,9 @@ impl ObjectWriter for S3ObjectWriter {
             }
             Err(error) => {
                 let message = format!(
-                    "failed to write S3 object '{key}' to bucket '{}': {error}",
-                    self.bucket
+                    "failed to write S3 object '{key}' to bucket '{}': {}",
+                    self.bucket,
+                    format_error_chain(&error)
                 );
                 self.abort().await?;
                 Err(AppError::Internal(message))
@@ -318,6 +335,39 @@ fn next_temp_object_id() -> u64 {
     TEMP_OBJECT_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+fn configuration_summary() -> String {
+    let endpoint = environment_value("AWS_ENDPOINT_URL");
+    let region = environment_value("AWS_REGION");
+    let profile = environment_value("AWS_PROFILE");
+    let role_arn = environment_value("AWS_ROLE_ARN");
+    let token_file = environment_value("AWS_WEB_IDENTITY_TOKEN_FILE");
+    format!(
+        "S3 configuration: endpoint={endpoint}, region={region}, force_path_style=true; \
+         credential context: AWS_PROFILE={profile}, AWS_ROLE_ARN={role_arn}, \
+         AWS_WEB_IDENTITY_TOKEN_FILE={token_file}"
+    )
+}
+
+fn environment_value(name: &str) -> String {
+    std::env::var_os(name)
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<unset>".to_string())
+}
+
+fn format_error_chain(error: &(dyn Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        let detail = error.to_string();
+        if !detail.is_empty() && !message.ends_with(&detail) {
+            message.push_str(": ");
+            message.push_str(&detail);
+        }
+        source = error.source();
+    }
+    message
+}
+
 fn is_s3_head_not_found(error: &SdkError<HeadObjectError>) -> bool {
     error.as_service_error().is_some_and(|error| {
         error.is_not_found()
@@ -344,7 +394,9 @@ fn is_s3_precondition_failed(error: &SdkError<PutObjectError>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{OBJECT_KEY_PREFIX, default_temp_directory};
+    use super::{OBJECT_KEY_PREFIX, default_temp_directory, format_error_chain};
+    use std::error::Error;
+    use std::fmt;
     use std::path::PathBuf;
 
     #[test]
@@ -357,6 +409,43 @@ mod tests {
         assert_eq!(
             default_temp_directory(),
             PathBuf::from("/var/tmp/reposnake")
+        );
+    }
+
+    #[derive(Debug)]
+    struct ChainedError {
+        message: &'static str,
+        source: Option<Box<ChainedError>>,
+    }
+
+    impl fmt::Display for ChainedError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.message)
+        }
+    }
+
+    impl Error for ChainedError {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            self.source.as_deref().map(|error| error as &dyn Error)
+        }
+    }
+
+    #[test]
+    fn error_formatter_includes_the_full_source_chain() {
+        let error = ChainedError {
+            message: "request failed",
+            source: Some(Box::new(ChainedError {
+                message: "credentials failed",
+                source: Some(Box::new(ChainedError {
+                    message: "token exchange returned invalid XML",
+                    source: None,
+                })),
+            })),
+        };
+
+        assert_eq!(
+            format_error_chain(&error),
+            "request failed: credentials failed: token exchange returned invalid XML"
         );
     }
 }

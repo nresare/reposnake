@@ -2949,6 +2949,7 @@ version = "11.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "881733cbc631fc9e472e24447ce32a64bedf2da498d6d8570b08edc87de71f65"
 dependencies = [
+ "aws-lc-rs",
  "base64 0.22.1",
  "ed25519-dalek",
  "getrandom 0.2.17",
@@ -4109,7 +4110,7 @@ dependencies = [
  "flate2",
  "handlebars",
  "hex",
- "jsonwebtoken 10.4.0",
+ "jsonwebtoken 11.0.0",
  "mime_guess",
  "reqwest",
  "rust-embed",

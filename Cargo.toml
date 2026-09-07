@@ -23,7 +23,7 @@ hex = "0.4"
 handlebars = "6.4"
 flate2 = "1.1"
 filetime = "0.2"
-jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11.0", features = ["aws_lc_rs"] }
 mime_guess = "2.0"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 rust-embed = "8.11"

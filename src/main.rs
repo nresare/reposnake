@@ -37,7 +37,8 @@ async fn main() -> anyhow::Result<()> {
     let log_filter = if cli.debug {
         "reposnake=debug,tower_http=info,axum::rejection=trace"
     } else {
-        "reposnake=info,tower_http=info,axum::rejection=info"
+        // Axum logs extractor rejections (including query parsing errors) at TRACE.
+        "reposnake=info,tower_http=info,axum::rejection=trace"
     };
     tracing_subscriber::registry()
         .with(EnvFilter::new(log_filter))

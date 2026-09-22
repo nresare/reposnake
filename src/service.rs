@@ -276,22 +276,19 @@ async fn oci_dispatch(
 
 async fn oci_token(
     State(state): State<AppState>,
-    Query(request): Query<OciTokenRequest>,
+    Query(parameters): Query<Vec<(String, String)>>,
     headers: HeaderMap,
 ) -> Result<Json<OciTokenResponse>, AppError> {
     let token = auth::extract_upload_token(&headers)?;
-    if let Some(scope) = request.scope.as_deref() {
-        authorize_oci_token_scope(&state, Some(&token), scope)?;
+    for (name, scope) in &parameters {
+        if name == "scope" {
+            authorize_oci_token_scope(&state, Some(&token), scope)?;
+        }
     }
     Ok(Json(OciTokenResponse {
         token: token.clone(),
         access_token: token,
     }))
-}
-
-#[derive(Deserialize)]
-struct OciTokenRequest {
-    scope: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2452,22 +2449,30 @@ mod tests {
         let token = test_token("builder", "ci");
         let credentials = general_purpose::STANDARD.encode(format!("__token__:{token}"));
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v2/token?service=packages.example&scope=repository:team/image:pull,push")
-                    .header(header::AUTHORIZATION, format!("Basic {credentials}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        for uri in [
+            "/v2/token?service=packages.example",
+            "/v2/token?service=packages.example&scope=repository:team/image:pull,push",
+            "/v2/token?scope=repository%3Ateam%2Fimage%3Apull%2Cpush&scope=repository%3Areposnake%3Apull&service=packages.example",
+            "/v2/token?scope=repository%3Areposnake%3Apull&scope=repository%3Ateam%2Fimage%3Apull%2Cpush&service=packages.example",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Basic {credentials}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["token"], token);
-        assert_eq!(body["access_token"], token);
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["token"], token);
+            assert_eq!(body["access_token"], token);
+        }
     }
 
     #[tokio::test]
@@ -2478,18 +2483,25 @@ mod tests {
         let token = test_token("builder", "other");
         let credentials = general_purpose::STANDARD.encode(format!("__token__:{token}"));
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v2/token?scope=repository:team/image:pull,push")
-                    .header(header::AUTHORIZATION, format!("Basic {credentials}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        for uri in [
+            "/v2/token?scope=repository:team/image:pull,push",
+            "/v2/token?scope=repository:team/image:pull,push&scope=repository:reposnake:pull",
+            "/v2/token?scope=repository:reposnake:pull&scope=repository:team/image:pull,push",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Basic {credentials}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
     }
 
     #[tokio::test]

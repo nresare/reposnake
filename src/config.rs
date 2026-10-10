@@ -13,8 +13,9 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
-    #[serde(default = "default_bind_address")]
-    pub bind_address: String,
+    pub bind_address: Option<String>,
+    pub tls_cert_path: Option<String>,
+    pub tls_key_path: Option<String>,
     pub origin: String,
     #[serde(default = "default_max_upload_bytes")]
     pub max_upload_bytes: usize,
@@ -115,6 +116,16 @@ pub struct ObjectCacheConfig {
 }
 
 impl Config {
+    pub fn bind_address(&self) -> &str {
+        self.bind_address
+            .as_deref()
+            .unwrap_or(if self.tls_cert_path.is_some() {
+                "0.0.0.0:8443"
+            } else {
+                "0.0.0.0:8080"
+            })
+    }
+
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Could not read config file '{path}'"))?;
@@ -123,7 +134,7 @@ impl Config {
     }
 
     pub fn validate(&self, disable_auth: bool) -> anyhow::Result<()> {
-        if self.bind_address.is_empty() {
+        if self.bind_address().is_empty() {
             anyhow::bail!("bind-address must not be empty");
         }
         if self.origin.is_empty() {
@@ -369,10 +380,6 @@ impl PublisherConfig {
     }
 }
 
-fn default_bind_address() -> String {
-    "0.0.0.0:8080".to_string()
-}
-
 fn default_object_store_directory() -> PathBuf {
     "/data".into()
 }
@@ -505,7 +512,7 @@ role = "buildkite"
         .unwrap();
 
         config.validate(false).unwrap();
-        assert_eq!(config.bind_address, "0.0.0.0:8080");
+        assert_eq!(config.bind_address(), "0.0.0.0:8080");
         assert_eq!(config.origin, "http://localhost:8080");
         assert_eq!(config.max_upload_bytes, 100 * 1024 * 1024);
         assert_eq!(config.metadata_store.uri, "mem://");

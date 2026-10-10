@@ -1,4 +1,5 @@
-bind-address = "0.0.0.0:8080"
+tls-cert-path = "/tls/tls.crt"
+tls-key-path = "/tls/tls.key"
 max-upload-bytes = 104857600
 origin = "https://repo.noa.re"
 admin-role = "kubernetes"
@@ -7,12 +8,14 @@ admin-role = "kubernetes"
 name = "kubernetes"
 audience = "repo.noa.re"
 issuer = "https://k8s.noa.re"
+algorithms = ["ES256"]
 claims = {sub="system:serviceaccount:default:default"}
 
 [[role]]
 name = "buildkite"
 audience = "repo.noa.re"
 issuer = "https://agent.buildkite.com"
+algorithms = ["ES256", "RS256"]
 claims = {organization_slug="nresare"}
 
 [[publisher]]

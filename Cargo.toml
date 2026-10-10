@@ -16,6 +16,7 @@ authzoo = "0.1.4"
 aws-config = { version = "1.12", optional = true }
 aws-sdk-s3 = { version = "1.149", optional = true }
 axum = { version = "0.8", features = ["multipart"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6", features = ["derive"] }
@@ -27,6 +28,7 @@ jsonwebtoken = { version = "11.1", features = ["aws_lc_rs"] }
 mime_guess = "2.0"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 rust-embed = "8.12"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
@@ -42,6 +44,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["http2"] }
 tempfile = "3.27"
 tower = { version = "0.5", features = ["util"] }
 surrealdb = { version = "3.2", default-features = false, features = ["kv-mem"] }

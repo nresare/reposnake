@@ -2,11 +2,13 @@
 // SPDX-FileCopyrightText: The reposnake contributors
 
 use axum::Router;
+use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use reposnake::config::Config;
 use reposnake::service::{build_app_state, build_router};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::path::Path;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
@@ -56,7 +58,8 @@ async fn main() -> anyhow::Result<()> {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let config = Config::load(&cli.config_path)?;
     config.validate(cli.disable_auth)?;
-    let bind_address: SocketAddr = config.bind_address.parse()?;
+    let bind_address: SocketAddr = config.bind_address().parse()?;
+    let tls = reposnake::tls::load(&config, Path::new(&cli.config_path)).await?;
     let object_directory = config.object_store.directory_or_default();
 
     info!(
@@ -71,7 +74,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let state = build_app_state(&config, cli.disable_auth).await?;
     let app: Router = build_router(state);
     let listeners = bind_listeners(bind_address).await?;
-    serve_listeners(listeners, app).await?;
+    serve_listeners(listeners, app, tls).await?;
     Ok(())
 }
 
@@ -144,11 +147,20 @@ async fn bind_listener(address: SocketAddr, force_ipv6_only: bool) -> anyhow::Re
     Ok(TcpListener::from_std(listener)?)
 }
 
-async fn serve_listeners(listeners: Vec<TcpListener>, app: Router) -> anyhow::Result<()> {
+async fn serve_listeners(
+    listeners: Vec<TcpListener>,
+    app: Router,
+    tls: Option<RustlsConfig>,
+) -> anyhow::Result<()> {
     let mut servers = JoinSet::new();
     for listener in listeners {
         let app = app.clone();
-        servers.spawn(async move { axum::serve(listener, app).await });
+        if let Some(tls) = &tls {
+            let server = axum_server::from_tcp_rustls(listener.into_std()?, tls.clone())?;
+            servers.spawn(server.serve(app.into_make_service()));
+        } else {
+            servers.spawn(async move { axum::serve(listener, app).await });
+        }
     }
 
     if let Some(result) = servers.join_next().await {
@@ -160,7 +172,7 @@ async fn serve_listeners(listeners: Vec<TcpListener>, app: Router) -> anyhow::Re
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_listeners, listener_addresses};
+    use super::{bind_listeners, listener_addresses, serve_listeners};
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
     #[test]
@@ -211,5 +223,102 @@ mod tests {
                 .iter()
                 .any(|listener| listener.local_addr().unwrap().is_ipv4())
         );
+    }
+
+    #[tokio::test]
+    async fn serves_http_and_https_on_all_bound_listeners() {
+        use axum::{Router, routing::get};
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
+        use std::path::Path;
+        use std::sync::Arc;
+
+        for tls_enabled in [false, true] {
+            let listeners = bind_listeners("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let addresses: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+            assert!(addresses.iter().any(SocketAddr::is_ipv4));
+            let tls = if tls_enabled {
+                let config = toml::from_str::<reposnake::config::Config>(
+                    "origin = 'https://localhost'\ntls-cert-path = 'cert.pem'\ntls-key-path = 'test-only-key.pem'"
+                ).unwrap();
+                reposnake::tls::load(
+                    &config,
+                    &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/tls/config.toml"),
+                )
+                .await
+                .unwrap()
+            } else {
+                None
+            };
+            if let Some(tls) = &tls {
+                assert_eq!(
+                    tls.get_inner().alpn_protocols,
+                    [b"h2".to_vec(), b"http/1.1".to_vec()]
+                );
+            }
+            let app = Router::new().route("/healthz", get(|| async { "ok" }));
+            let task = tokio::spawn(serve_listeners(listeners, app, tls));
+            for address in addresses {
+                for http2 in [false, true] {
+                    if http2 && !tls_enabled {
+                        continue;
+                    }
+                    let mut client = reqwest::Client::builder()
+                        .no_proxy()
+                        .resolve("localhost", address)
+                        .timeout(std::time::Duration::from_secs(5));
+                    if tls_enabled {
+                        let mut roots = rustls::RootCertStore::empty();
+                        roots
+                            .add(
+                                CertificateDer::from_pem_slice(include_bytes!(
+                                    "../tests/tls/cert.pem"
+                                ))
+                                .unwrap(),
+                            )
+                            .unwrap();
+                        let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+                            rustls::crypto::ring::default_provider(),
+                        ))
+                        .with_safe_default_protocol_versions()
+                        .unwrap()
+                        .with_root_certificates(roots)
+                        .with_no_client_auth();
+                        client_tls.alpn_protocols = if http2 {
+                            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+                        } else {
+                            vec![b"http/1.1".to_vec()]
+                        };
+                        client = client.tls_backend_preconfigured(client_tls);
+                    }
+                    let client = if http2 {
+                        client.http2_prior_knowledge()
+                    } else {
+                        client.http1_only()
+                    }
+                    .build()
+                    .unwrap();
+                    let scheme = if tls_enabled { "https" } else { "http" };
+                    let response = client
+                        .get(format!("{scheme}://localhost:{}/healthz", address.port()))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), reqwest::StatusCode::OK);
+                    assert_eq!(
+                        response.version(),
+                        if http2 {
+                            reqwest::Version::HTTP_2
+                        } else {
+                            reqwest::Version::HTTP_11
+                        }
+                    );
+                    assert_eq!(response.text().await.unwrap(), "ok");
+                }
+            }
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
     }
 }

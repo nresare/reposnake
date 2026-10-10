@@ -72,6 +72,52 @@ An IPv4-any or IPv4-loopback `bind-address`, such as `0.0.0.0:8080` or `127.0.0.
 
 Project names in `projects` are normalized using the Python packaging rules for Python uploads, so `other_package` and `other-package` refer to the same project. The same list may also contain OCI repository names such as `team/image`. Use `projects = ["*"]` for a publisher policy that can upload any Python project or push any OCI repository.
 
+To serve HTTPS, configure both PEM paths. Relative paths resolve from the configuration
+file's directory. TLS advertises HTTP/2 and HTTP/1.1 through ALPN:
+
+```toml
+tls-cert-path = "tls/cert.pem"
+tls-key-path = "tls/key.pem"
+```
+
+The default bind address is `0.0.0.0:8443` with TLS and `0.0.0.0:8080` otherwise.
+An explicit `bind-address` overrides either default. Invalid, incomplete, or mismatched
+certificate/key settings cause startup to fail before connecting to storage.
+
+## Cluster deployment
+
+Commits to `main` use `.buildkite/pipelinegen.toml` to test, publish a container image,
+and notify relcoord. Relcoord reads `.deploy` from that same commit, generates
+manifests using the website plugin from system, and pushes them to the configured
+manifest repository for Argo CD to reconcile. The image comes from the build;
+`.deploy` deliberately does not pin an image tag.
+
+The cluster configuration retains two replicas, the existing S3 bucket and endpoint,
+SurrealDB/idmouse settings, and projected token audiences. The website plugin creates
+a cluster-local certificate mounted at `/tls`, HTTPS probes, a Service on port 443
+forwarding to port 8443, and a BackendTLSPolicy that verifies the certificate against
+the `cluster-local-ca` ConfigMap. The namespace's `trust: cluster-local` label makes
+trust-manager install that CA bundle.
+
+For the handoff from system:
+
+1. Keep the existing `reposnake/` manifests in the fruktsallad output repository
+   throughout the switchover. Removing `reposnake` from `owners/system.toml` is
+   preparation; it does not confirm that Argo CD has adopted the new deployment.
+2. Merge the reposnake changes and let its main-branch Buildkite deployment complete.
+   Confirm `owners/reposnake.toml` contains `owned = "reposnake"`, the generated
+   image is the one from this build, and Argo CD has synced the workload and reports
+   it healthy. Verify HTTPS traffic to `https://repo.noa.re` succeeds.
+3. Only then merge the system cleanup that removes its `repo.noa.re` website block
+   and `reposnake/reposnake.toml`. Future reposnake commits deploy through the same
+   Buildkite/relcoord pipeline.
+
+Avoid system deployments during the handoff. Before reposnake claims the namespace,
+system's old website block can reclaim it; afterwards, that block conflicts with
+reposnake ownership and generation fails without pushing manifests. The cleanup
+removes that conflict. Infrastructure such as the website plugin, CA, and idmouse
+token policy remains in system.
+
 ## Installing
 
 Point pip at the Simple API:

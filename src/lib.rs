@@ -15,4 +15,5 @@ pub mod repository;
 #[cfg(feature = "s3")]
 pub mod s3_object_store;
 pub mod service;
+pub mod tls;
 pub mod web;

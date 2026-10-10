@@ -1,4 +1,7 @@
-bind-address = "0.0.0.0:8080"
+# Optional: defaults to port 8080 for HTTP, or 8443 when TLS is configured.
+# bind-address = "0.0.0.0:8080"
+# tls-cert-path = "tls/cert.pem"
+# tls-key-path = "tls/key.pem"
 # IPv4-any and IPv4-loopback bind addresses listen on both IPv4 and IPv6 when IPv6 is available.
 origin = "http://localhost:8080"
 max-upload-bytes = 104857600

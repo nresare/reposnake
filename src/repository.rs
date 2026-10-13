@@ -728,8 +728,10 @@ fn extract_wheel_metadata(content: &[u8]) -> Result<Option<Vec<u8>>, AppError> {
         let mut file = archive.by_index(index).map_err(|error| {
             AppError::BadRequest(format!("failed to inspect wheel metadata: {error}"))
         })?;
-        let name = file.name();
-        if !is_wheel_metadata_path(name) {
+        let name = file.name().map_err(|error| {
+            AppError::BadRequest(format!("failed to inspect wheel metadata: {error}"))
+        })?;
+        if !is_wheel_metadata_path(&name) {
             continue;
         }
         let mut metadata = Vec::new();

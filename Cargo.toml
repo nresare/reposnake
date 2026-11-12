@@ -33,7 +33,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
 socket2 = "0.6"
-surrealdb = { version = "3.2", default-features = false, features = ["protocol-ws"], optional = true }
+surrealdb = { version = "4.0", default-features = false, features = ["protocol-ws"], optional = true }
 tar = "0.4"
 thiserror = "2.0"
 tokio = { version = "1.53", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync"] }
@@ -47,4 +47,4 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 reqwest = { version = "0.13", default-features = false, features = ["http2"] }
 tempfile = "3.27"
 tower = { version = "0.5", features = ["util"] }
-surrealdb = { version = "3.2", default-features = false, features = ["kv-mem"] }
+surrealdb = { version = "4.0", default-features = false, features = ["kv-mem"] }
